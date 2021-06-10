@@ -27,3 +27,5 @@ sci.exp
 sci.lib
 sci.pdb
 sci.stripped.pdb
+/.lsp
+sci.build_artifacts.txt

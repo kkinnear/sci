@@ -9,6 +9,7 @@
    [sci.impl.fns :as fns]
    [sci.impl.for-macro :refer [expand-for]]
    [sci.impl.interop :as interop]
+   [sci.impl.load :as load]
    [sci.impl.records :as records]
    [sci.impl.resolve :as resolve]
    [sci.impl.types :as types]
@@ -16,8 +17,10 @@
     [mark-eval mark-eval-call constant?
      rethrow-with-location-of-node
      merge-meta set-namespace!
-     macro? ana-macros kw-identical? ctx-fn]]
-   [sci.impl.vars :as vars])
+     macro? ana-macros kw-identical? ctx-fn
+     maybe-destructured]]
+   [sci.impl.vars :as vars]
+   #?(:cljs [goog.object :as gobject]))
   #?(:clj (:import [sci.impl Reflector]))
   #?(:cljs
      (:require-macros
@@ -38,7 +41,7 @@
 (defn- throw-error-with-location [msg node]
   (utils/throw-error-with-location msg node {:phase "analysis"}))
 
-(declare analyze analyze-call)
+(declare analyze analyze-call return-call return-map)
 
 ;;;; Macros
 
@@ -51,16 +54,20 @@
                 (contains? #{'for} op) (analyze (assoc ctx :sci.impl/macroexpanding true)
                                                 expr)
                 :else
-                (let [f (resolve/resolve-symbol ctx op true)
-                      f (if (and (vars/var? f)
-                                 (vars/isMacro f))
-                          @f f)]
-                  (if (macro? f)
-                    (let [f (if (identical? utils/needs-ctx (some-> f meta :sci.impl/op))
-                              (partial f ctx)
-                              f)]
-                      (apply f original-expr (:bindings ctx) (rest expr)))
-                    expr)))
+                (let [f (try (resolve/resolve-symbol ctx op true)
+                             (catch #?(:clj Exception :cljs :default)
+                                 _ ::unresolved))]
+                  (if (kw-identical? ::unresolved f)
+                    expr
+                    (let [f (if (and (vars/var? f)
+                                     (vars/isMacro f))
+                              @f f)]
+                      (if (macro? f)
+                        (let [f (if (identical? utils/needs-ctx (some-> f meta :sci.impl/op))
+                                  (partial f ctx)
+                                  f)]
+                          (apply f original-expr (:bindings ctx) (rest expr)))
+                        expr)))))
           expr))
       expr)))
 
@@ -191,7 +198,7 @@
             [0 `(ctx-fn
                  (fn [~'_]
                    recur-0)
-                ~'expr)]
+                 ~'expr)]
             (mapcat (fn [[i binds]]
                       [i `(let ~binds
                             (ctx-fn
@@ -218,25 +225,9 @@
 (defn analyze-children [ctx children]
   (mapv #(analyze ctx %) children))
 
-(defn maybe-destructured
-  [params body]
-  (if (every? symbol? params)
-    {:params params
-     :body body}
-    (loop [params params
-           new-params (with-meta [] (meta params))
-           lets []]
-      (if params
-        (if (symbol? (first params))
-          (recur (next params) (conj new-params (first params)) lets)
-          (let [gparam (gensym "p__")]
-            (recur (next params) (conj new-params gparam)
-                   (-> lets (conj (first params)) (conj gparam)))))
-        {:params new-params
-         :body [`(let ~lets
-                   ~@body)]}))))
+(defrecord FnBody [params body fixed-arity var-arg-name])
 
-(defn expand-fn-args+body [{:keys [:fn-expr] :as ctx} fn-name [binding-vector & body-exprs] macro?]
+(defn expand-fn-args+body [{:keys [:fn-expr] :as ctx} [binding-vector & body-exprs] macro?]
   (when-not binding-vector
     (throw-error-with-location "Parameter declaration missing." fn-expr))
   (when-not (vector? binding-vector)
@@ -269,21 +260,19 @@
         ctx (update ctx :bindings merge (zipmap params
                                                 (repeat nil)))
         body (return-do fn-expr (analyze-children ctx body))]
-    #:sci.impl{:body body
-               :params params
-               :fixed-arity fixed-arity
-               :var-arg-name var-arg-name
-               :fn-name fn-name}))
+    (->FnBody params body fixed-arity var-arg-name)))
 
 (defn analyzed-fn-meta [ctx m]
   (let [;; seq expr has location info with 2 keys
         meta-needs-eval? (> (count m) 2)
         ;; TODO: users might have parsed using :end-line still
-        m (if meta-needs-eval? (mark-eval (analyze ctx m))
+        m (if meta-needs-eval? (mark-eval
+                                (analyze (assoc ctx :meta true) m))
               m)]
     m))
 
-(defn expand-fn [ctx [_fn name? & body :as fn-expr] macro?]
+
+(defn expand-fn* [ctx [_fn name? & body :as fn-expr] macro?]
   (let [ctx (assoc ctx :fn-expr fn-expr)
         fn-name (if (symbol? name?)
                   name?
@@ -300,10 +289,10 @@
         analyzed-bodies (reduce
                          (fn [{:keys [:max-fixed :min-varargs] :as acc} body]
                            (let [arglist (first body)
-                                 body (expand-fn-args+body ctx fn-name body macro?)
-                                 body (assoc body :sci.impl/arglist arglist)
-                                 var-arg-name (:sci.impl/var-arg-name body)
-                                 fixed-arity (:sci.impl/fixed-arity body)
+                                 body (expand-fn-args+body ctx body macro?)
+                                 ;; body (assoc body :sci.impl/arglist arglist)
+                                 var-arg-name (:var-arg-name body)
+                                 fixed-arity (:fixed-arity body)
                                  new-min-varargs (when var-arg-name fixed-arity)]
                              (when (and var-arg-name min-varargs)
                                (throw-error-with-location "Can't have more than 1 variadic overload" fn-expr))
@@ -312,7 +301,7 @@
                                 "Can't have fixed arity function with more params than variadic function" fn-expr))
                              (-> acc
                                  (assoc :min-varargs new-min-varargs
-                                        :max-fixed (max (:sci.impl/fixed-arity body)
+                                        :max-fixed (max fixed-arity
                                                         max-fixed))
                                  (update :bodies conj body)
                                  (update :arglists conj arglist))))
@@ -326,20 +315,51 @@
         ana-fn-meta (analyzed-fn-meta ctx fn-meta)
         fn-meta (when-not (identical? fn-meta ana-fn-meta)
                   ;; fn-meta contains more than only location info
-                  (-> ana-fn-meta (dissoc :line :end-line :column :end-column)))]
-    (with-meta #:sci.impl{:fn-bodies arities
+                  (-> ana-fn-meta (dissoc :line :end-line :column :end-column)))
+        struct #:sci.impl{:fn-bodies arities
                           :fn-name fn-name
                           :arglists arglists
                           :fn true
                           :fn-meta fn-meta}
-      {:sci.impl/op :fn})))
+        struct (with-meta struct
+                 {:sci.impl/op :fn})]
+    struct))
+
+(defn fn-ctx-fn [_ctx struct fn-meta]
+  (let [fn-name (:sci.impl/fn-name struct)
+        fn-bodies (:sci.impl/fn-bodies struct)
+        defn? (:sci.impl/defn struct)
+        macro? (:sci/macro struct)
+        self-ref? (and fn-name (not defn?))
+        single-arity (when (= 1 (count fn-bodies))
+                       (first fn-bodies))]
+    (if fn-meta
+      (fn [ctx]
+        (let [fn-meta (eval/handle-meta ctx fn-meta)
+              f (fns/eval-fn ctx fn-name fn-bodies macro? single-arity self-ref?)]
+          (vary-meta f merge fn-meta)))
+      (fn [ctx]
+        (fns/eval-fn ctx fn-name fn-bodies macro? single-arity self-ref?)))))
+
+(defn expand-fn [ctx fn-expr macro?]
+  (let [struct (expand-fn* ctx fn-expr macro?)
+        fn-meta (:sci.impl/fn-meta struct)
+        ctxfn (fn-ctx-fn ctx struct fn-meta)]
+    (ctx-fn ctxfn
+            struct
+            struct)))
 
 (defn expand-let*
   [ctx destructured-let-bindings exprs]
   (let [[ctx new-let-bindings]
         (reduce
          (fn [[ctx new-let-bindings] [binding-name binding-value]]
-           (let [v (analyze ctx binding-value)]
+           (let [m (meta binding-value)
+                 t (when m (:tag m))
+                 binding-name (if t (vary-meta binding-name
+                                               assoc :tag t)
+                                  binding-name)
+                 v (analyze ctx binding-value)]
              [(update ctx :bindings assoc binding-name v)
               (conj new-let-bindings binding-name v)]))
          [ctx []]
@@ -378,19 +398,7 @@
                    :sci.impl/var.unbound
                    (analyze ctx init))
             m (meta var-name)
-            mks (keys m)
-            k (some
-               #(not
-                 (contains? #{:line :column :dynamic :private :const :doc :tag
-                              :arglists} %))
-               mks)
-            m (if k
-                #_:clj-kondo/ignore
-                (do
-                  #_(when-not (:test m)
-                      (prn "WARNING: ANA def " k m))
-                  (analyze ctx m))
-                m)
+            m (analyze (assoc ctx :meta true) m)
             m (assoc m :ns @vars/current-ns)
             m (if docstring (assoc m :doc docstring) m)
             var-name (with-meta var-name m)]
@@ -411,23 +419,19 @@
                     (when (string? ds) ds))
         meta-map (when-let [m (last pre-body)]
                    (when (map? m) m))
+        [meta-map2 body] (if (seq? (first body))
+                           (let [lb (last body)]
+                             (if (map? lb)
+                               [lb (butlast body)]
+                               [nil body]))
+                           [nil body])
         meta-map (merge (meta fn-name) (meta expr) meta-map)
-        mks (keys meta-map)
-        k (some
-           #(not
-             (contains? #{:line :column :dynamic :private :const :doc
-                          :arglists :sci.impl/op :added :skip-wiki :no-doc
-                          :tag :macro} %))
-           mks)
-        meta-map (if k
-                   #_:clj-kondo/ignore
-                   (do
-                     #_(prn "WARNING: ANA defn" k meta-map)
-                     (analyze ctx meta-map))
-                   meta-map)
+        meta-map (if meta-map2 (merge meta-map meta-map2)
+                     meta-map)
+        meta-map (analyze (assoc ctx :meta true) meta-map)
         fn-body (with-meta (cons 'fn body)
                   (meta expr))
-        f (expand-fn ctx fn-body macro?)
+        f (expand-fn* ctx fn-body macro?)
         arglists (seq (:sci.impl/arglists f))
         meta-map (assoc meta-map
                         :ns @vars/current-ns
@@ -439,7 +443,10 @@
         f (assoc f
                  :sci/macro macro?
                  :sci.impl/fn-name fn-name
-                 :sci.impl/var true)]
+                 :sci.impl/defn true)
+        fn-meta (:sci.impl/fn-meta f)
+        ctxfn (fn-ctx-fn ctx f fn-meta)
+        f (ctx-fn ctxfn f f)]
     (ctx-fn
      (fn [ctx]
        (eval/eval-def ctx fn-name f))
@@ -462,35 +469,52 @@
                                syms))]
     (analyze ctx expansion)))
 
-(defn expand-lazy-seq
+(defn analyze-lazy-seq
   [ctx expr]
-  (let [body (rest expr)]
-    (mark-eval-call
-     (list `lazy-seq
-           (analyze ctx
-                    ;; expand-fn will take care of the analysis of the body
-                    (list 'fn [] (cons 'do body)))))))
+  (let [body (rest expr)
+        ana (analyze ctx (cons 'do body))]
+    (ctx-fn (fn [ctx]
+              (lazy-seq (eval/eval ctx ana)))
+            expr)))
 
-(defn expand-if
-  [ctx [_if & exprs :as expr]]
-  (case (count exprs)
-    (0 1) (throw-error-with-location "Too few arguments to if" expr)
-    (2 3) (let [[cond then else] (analyze-children ctx exprs)]
-            (ctx-fn
-             (fn [ctx]
-               (eval/eval-if ctx cond then else))
-             ;; backward compatibility with stacktrace
-             (with-meta expr {:sci.impl/op :call})))
-    (throw-error-with-location "Too many arguments to if" expr)))
-
-(defn expand-case
+(defn return-if
   [ctx expr]
-  (let [v (analyze ctx (second expr))
+  (let [exprs (rest expr)
+        children (analyze-children ctx exprs)]
+    (case (count children)
+      (0 1) (throw-error-with-location "Too few arguments to if" expr)
+      2 (let [condition (nth children 0)
+              then (nth children 1)]
+          (cond (not condition) nil
+                (constant? condition) then
+                :else (ctx-fn
+                       (fn [ctx]
+                         (when (eval/eval ctx condition)
+                           (eval/eval ctx then)))
+                       ;; backward compatibility with stacktrace
+                       (with-meta expr {:sci.impl/op :call}))))
+      3 (let [condition (nth children 0)
+              then (nth children 1)
+              else (nth children 2)]
+          (cond (not condition) else
+                (constant? condition) then
+                :else (ctx-fn
+                       (fn [ctx]
+                         (if (eval/eval ctx condition)
+                           (eval/eval ctx then)
+                           (eval/eval ctx else)))
+                       ;; backward compatibility with stacktrace
+                       (with-meta expr {:sci.impl/op :call}))))
+      (throw-error-with-location "Too many arguments to if" expr))))
+
+(defn analyze-case
+  [ctx expr]
+  (let [case-val (analyze ctx (second expr))
         clauses (nnext expr)
         match-clauses (take-nth 2 clauses)
         result-clauses (analyze-children ctx (take-nth 2 (rest clauses)))
-        default (when (odd? (count clauses))
-                  [:val (analyze ctx (last clauses))])
+        [default? case-default] (when (odd? (count clauses))
+                  [true (analyze ctx (last clauses))])
         cases (interleave match-clauses result-clauses)
         assoc-new (fn [m k v]
                     (if-not (contains? m k)
@@ -512,19 +536,23 @@
                           cases
                           (assoc-new ret-map k v))))
                      ret-map))
-        ret (mark-eval-call (list 'case
-                                  {:case-map case-map
-                                   :case-val v
-                                   :case-default default}
-                                  default))]
-    (mark-eval-call ret)))
+        f (if default?
+            (fn [ctx]
+              (eval/eval-case ctx case-map case-val case-default))
+            (fn [ctx]
+              (eval/eval-case ctx case-map case-val)))]
+    (ctx-fn
+     f
+     ;; legacy structure for error reporting
+     (mark-eval-call (list 'case)))))
 
-(defn expand-try
-  [ctx [_try & body]]
-  (let [[body-exprs
+(defn analyze-try
+  [ctx expr]
+  (let [body (next expr)
+        [body-exprs
          catches
          finally]
-        (loop [exprs (seq body)
+        (loop [exprs body
                body-exprs []
                catch-exprs []
                finally-expr nil]
@@ -552,46 +580,50 @@
                       catches)
         finally (when finally
                   (analyze ctx (cons 'do (rest finally))))]
-    (with-meta
-      {:sci.impl/try
-       {:body body
-        :catches catches
-        :finally finally}}
-      {:sci.impl/op :try})))
+    (ctx-fn (fn [ctx]
+              (eval/eval-try ctx body catches finally))
+            expr)))
+
+(defn analyze-throw [ctx [_throw ex :as expr]]
+  (when-not (= 2 (count expr))
+    (throw-error-with-location
+     #?(:clj "Too many arguments to throw, throw expects a single Throwable instance"
+        :cljs "Too many arguments to throw")
+     expr))
+  (let [ana (analyze ctx ex)]
+    (ctx-fn (fn [ctx]
+              (throw (eval/eval ctx ana)))
+            ;; legacy structure for error reporting
+            (mark-eval-call (list 'throw)))))
 
 (defn expand-declare [ctx [_declare & names :as expr]]
-  (swap! (:env ctx)
-         (fn [env]
-           (let [cnn (vars/current-ns-name)]
-             (update-in env [:namespaces cnn]
-                        (fn [current-ns]
-                          (reduce (fn [acc name]
-                                    (if-let [x (.get ^java.util.Map acc name)]
-                                      (if-let [prev-ns (some-> x meta :ns)]
-                                        (let [current-ns-name (vars/current-ns-name)]
-                                          (if-not (= (vars/getName prev-ns)
-                                                     current-ns-name)
-                                            (throw-error-with-location
-                                             (str name " already refers to "
-                                                  x " in namespace "
-                                                  current-ns-name)
-                                             expr)
-                                            ;; when the previous bound thing
-                                            ;; didn't have an ns, just assume
-                                            ;; things are ok to redefine
-                                            acc))
-                                        ;; declare does not override an existing var
-                                        acc)
-                                      (assoc acc name
-                                             (doto (vars/->SciVar nil (symbol (str cnn)
-                                                                              (str name))
-                                                                  {:name name
-                                                                   :ns @vars/current-ns
-                                                                   :file @vars/current-file}
-                                                                  false)
-                                               (vars/unbind)))))
-                                  current-ns
-                                  names))))))
+  (let [cnn (vars/current-ns-name)
+        env (:env ctx)
+        the-current-ns (get-in @env [:namespaces cnn])
+        refers (:refers the-current-ns)
+        the-current-ns (reduce (fn [acc name]
+                                 (if-let [x (and refers (.get ^java.util.Map refers name))]
+                                   (throw-error-with-location
+                                    (str name " already refers to "
+                                         x " in namespace "
+                                         cnn)
+                                    expr)
+                                   (if-not #?(:clj (.containsKey ^java.util.Map the-current-ns name)
+                                              :cljs (get the-current-ns name))
+                                     (assoc acc name
+                                            (doto (vars/->SciVar nil (symbol (str cnn)
+                                                                             (str name))
+                                                                 {:name name
+                                                                  :ns @vars/current-ns
+                                                                  :file @vars/current-file}
+                                                                 false)
+                                              (vars/unbind)))
+                                     the-current-ns)))
+                               the-current-ns
+                               names)]
+    (swap! env
+           (fn [env]
+             (update env :namespaces assoc cnn the-current-ns))))
   nil)
 
 ;;;; Interop
@@ -615,8 +647,11 @@
         res #?(:clj (if (class? instance-expr)
                       (if (nil? args)
                         (if (str/starts-with? method-expr "-")
-                          (with-meta [instance-expr (subs method-expr 1)]
-                            {:sci.impl/op :static-access})
+                          (ctx-fn
+                           (fn [_ctx]
+                             (interop/get-static-field [instance-expr (subs method-expr 1)]))
+                           (with-meta [instance-expr (subs method-expr 1)]
+                             {:sci.impl/op :static-access}))
                           ;; https://clojure.org/reference/java_interop
                           ;; If the second operand is a symbol and no args are
                           ;; supplied it is taken to be a field access - the
@@ -628,16 +663,39 @@
                           (if-let [_
                                    (try (Reflector/getStaticField ^Class instance-expr ^String method-expr)
                                         (catch IllegalArgumentException _ nil))]
-                            (with-meta [instance-expr method-expr]
+                            (ctx-fn
+                             (fn [_ctx]
+                               (interop/get-static-field [instance-expr method-expr]))
+                             (with-meta [instance-expr (subs method-expr 1)]
+                               {:sci.impl/op :static-access})) #_(with-meta [instance-expr method-expr]
                               {:sci.impl/op :static-access})
-                            (mark-eval-call
-                             `(~(with-meta [instance-expr method-expr]
-                                  {:sci.impl/op :static-access}) ~@args))))
-                        (mark-eval-call
-                         `(~(with-meta [instance-expr method-expr]
-                              {:sci.impl/op :static-access}) ~@args)))
-                      (mark-eval-call `(~'. ~instance-expr ~method-expr ~args)))
-               :cljs (mark-eval-call `(~'. ~instance-expr ~method-expr ~args)))]
+                            (ctx-fn
+                             (fn [ctx]
+                               (eval/eval-static-method-invocation ctx (cons [instance-expr method-expr] args)))
+                             (mark-eval-call (cons (with-meta [instance-expr method-expr]
+                                                     {:sci.impl/op :static-access})
+                                                   args)))))
+                        (ctx-fn
+                         (fn [ctx]
+                           (eval/eval-static-method-invocation ctx (cons [instance-expr method-expr] args)))
+                         (mark-eval-call (cons (with-meta [instance-expr method-expr]
+                                                 {:sci.impl/op :static-access})
+                                               args))))
+                      (ctx-fn (fn [ctx]
+                                (eval/eval-instance-method-invocation ctx instance-expr method-expr args))
+                              ;; this info is used by set!
+                              {::instance-expr instance-expr
+                               ::method-expr method-expr}
+                              ;; legacy error reporting for (.foo 1)
+                              (mark-eval-call _expr)
+                              ))
+               :cljs (ctx-fn (fn [ctx]
+                               (eval/eval-instance-method-invocation ctx instance-expr method-expr args))
+                             ;; this info is used by set!
+                             {::instance-expr instance-expr
+                              ::method-expr method-expr}
+                             ;; legacy error reporting for (.foo 1)
+                             (mark-eval-call _expr)))]
     res))
 
 (defn expand-dot**
@@ -656,14 +714,22 @@
                 "Malformed member expression, expecting (.member target ...)")))
   (expand-dot ctx (list '. obj (cons (symbol (subs (name method-name) 1)) args))))
 
-(defn expand-new [ctx [_new class-sym & args :as _expr]]
+(defn analyze-new [ctx [_new class-sym & args :as expr]]
   (if-let [#?(:clj {:keys [:class] :as _opts}
               :cljs {:keys [:constructor] :as _opts}) (interop/resolve-class-opts ctx class-sym)]
     (let [args (analyze-children ctx args)] ;; analyze args!
-      (mark-eval-call (list 'new #?(:clj class :cljs constructor) args)))
+      (ctx-fn
+       (fn [ctx]
+         (interop/invoke-constructor #?(:clj class :cljs constructor)
+                                     (mapv #(eval/eval ctx %) args)))
+       expr))
     (if-let [record (records/resolve-record-class ctx class-sym)]
       (let [args (analyze-children ctx args)]
-        (mark-eval-call (list* (:sci.impl.record/constructor (meta record)) args)))
+        (return-call ctx
+                     ;; for backwards compatibility with error reporting
+                     (mark-eval-call (list* (:sci.impl.record/constructor (meta record)) args))
+                     (:sci.impl.record/constructor (meta record))
+                     args))
       (throw-error-with-location (str "Unable to resolve classname: " class-sym) class-sym))))
 
 (defn expand-constructor [ctx [constructor-sym & args]]
@@ -671,12 +737,17 @@
         class-sym (with-meta (symbol (subs constructor-name 0
                                            (dec (count constructor-name))))
                     (meta constructor-sym))]
-    (expand-new ctx (with-meta (list* 'new class-sym args)
-                      (meta constructor-sym)))))
+    (analyze-new ctx (with-meta (list* 'new class-sym args)
+                       (meta constructor-sym)))))
 
 ;;;; End interop
 
 ;;;; Namespaces
+
+(defn return-ns-op [_ctx f expr analyzed-args]
+  (ctx-fn (fn [ctx]
+            (apply f ctx analyzed-args))
+          expr))
 
 (defn analyze-ns-form [ctx [_ns ns-name & exprs :as expr]]
   (when-not (symbol? ns-name)
@@ -703,23 +774,27 @@
       (if exprs
         (let [[k & args :as expr] (first exprs)]
           (case k
-            (:require :use)
+            (:require :use :import :refer-clojure)
             (recur (next exprs)
                    (conj ret
-                         (mark-eval-call
-                          (with-meta (list* (symbol (name k)) args)
-                            (meta expr)))))
-            :import (recur (next exprs) (conj ret (mark-eval-call
-                                                   (with-meta (list* 'import args)
-                                                     (meta expr)))))
-            :refer-clojure (recur (next exprs)
-                                  (conj ret
-                                        (mark-eval-call
-                                         (with-meta (list* 'refer 'clojure.core args)
-                                           (meta expr)))))
+                         (return-ns-op
+                          ctx (case k
+                                :require load/eval-require
+                                :use load/eval-use
+                                :import eval/eval-import
+                                :refer-clojure (fn [ctx & args]
+                                                 (apply load/eval-refer ctx 'clojure.core args)))
+                          expr args)))
             :gen-class ;; ignore
             (recur (next exprs) ret)))
-        (return-do expr ret)))))
+        (return-do
+         expr
+         (conj ret
+               (ctx-fn
+                (fn [ctx]
+                  (load/add-loaded-lib (:env ctx) ns-name)
+                  nil)
+                nil)))))))
 
 ;;;; End namespaces
 
@@ -727,17 +802,36 @@
 ;;;; Vars
 
 (defn analyze-var [ctx [_ var-name]]
-  (resolve/resolve-symbol (assoc ctx :sci.impl/prevent-deref true) var-name))
+  (resolve/resolve-symbol ctx var-name))
 
-(defn analyze-set! [ctx [_ obj v]]
-  (let [obj (analyze ctx obj)
-        v (analyze ctx v)
-        obj (types/getVal obj)]
-    (mark-eval-call (list 'set! obj v))))
+(defn analyze-set! [ctx [_ obj v :as expr]]
+  (cond (symbol? obj) ;; assume dynamic var
+        (let [obj (resolve/resolve-symbol ctx obj)
+              _ (when-not (vars/var? obj)
+                  (throw-error-with-location "Invalid assignment target" expr))
+              v (analyze ctx v)]
+          (ctx-fn (fn [ctx]
+                    (let [v (eval/eval ctx v)]
+                      (types/setVal obj v)))
+                  expr))
+        #?@(:cljs [(seq? obj)
+                   (let [obj (analyze ctx obj)
+                         v (analyze ctx v)
+                         obj (types/info obj)
+                         k (subs (::method-expr obj) 1)
+                         obj (::instance-expr obj)]
+                     (ctx-fn (fn [ctx]
+                               (let [obj (eval/eval ctx obj)
+                                     v (eval/eval ctx v)]
+                                 (gobject/set obj k v)))
+                             expr))])
+        :else (throw-error-with-location "Invalid assignment target" expr)))
 
 ;;;; End vars
 
 (defmacro gen-return-binding-call
+  "Creates returning-binding-call function, optimizes calling a local
+  binding as function."
   []
   (let [let-bindings (map (fn [i]
                             [i (vec (mapcat (fn [j]
@@ -793,6 +887,10 @@
 (declare return-needs-ctx-call) ;; for clj-kondo
 (gen-return-needs-ctx-call)
 
+;; NOTE: there is a small perf win (about 3%) when checking if all
+;; analyzed-children are EvalFn and then using those fns directly. See
+;; inline-evals branch.
+
 (defmacro gen-return-call
   []
   (let [let-bindings (map (fn [i]
@@ -821,202 +919,276 @@
 (declare return-call) ;; for clj-kondo
 (gen-return-call)
 
+(defn analyze-quote [_ctx expr]
+  (when-not (= 2 (count expr))
+    (throw-error-with-location "Wrong number of args (0) passed to quote" expr))
+  (let [snd (second expr)]
+    (ctx-fn (fn [_ctx] snd) expr)))
+
+(defn analyze-in-ns [ctx expr]
+  (let [ns-expr (analyze ctx (second expr))]
+    (ctx-fn (fn [ctx]
+              (let [ns-sym (eval/eval ctx ns-expr)]
+                (set-namespace! ctx ns-sym nil)
+                nil))
+            expr)))
+
+(defn analyze-import [_ctx expr]
+  (let [args (rest expr)]
+    (ctx-fn (fn [ctx]
+              (apply eval/eval-import ctx args))
+            (mark-eval-call expr))))
+
 (defn analyze-call [ctx expr top-level?]
   (let [f (first expr)]
     (cond (symbol? f)
-      (let [;; in call position Clojure prioritizes special symbols over
-            ;; bindings
-            special-sym (get special-syms f)
-            _ (when special-sym (resolve/check-permission! ctx special-sym f nil))
-            f (or special-sym
-                  (resolve/resolve-symbol ctx f true))
-            f-meta (meta f)
-            eval? (and f-meta (:sci.impl/op f-meta))]
-        (cond (and f-meta (::static-access f-meta))
-              (expand-dot** ctx (list* '. (first f) (second f) (rest expr)))
-              (and (not eval?) ;; the symbol is not a binding
-                   (or
-                    special-sym
-                    (contains? ana-macros f)))
-              (case f
-                ;; we treat every subexpression of a top-level do as a separate
-                ;; analysis/interpretation unit so we hand this over to the
-                ;; interpreter again, which will invoke analysis + evaluation on
-                ;; every sub expression
-                do (return-do expr (analyze-children ctx (rest expr)))
-                let (expand-let ctx expr)
-                (fn fn*) (expand-fn ctx expr false)
-                def (expand-def ctx expr)
-                ;; NOTE: defn / defmacro aren't implemented as normal macros yet
-                (defn defmacro) (let [ret (expand-defn ctx expr)]
-                                  ret)
-                ;; TODO: implement as normal macro in namespaces.cljc
-                loop (expand-loop ctx expr)
-                lazy-seq (expand-lazy-seq ctx expr)
-                for (let [res (expand-for ctx expr)]
-                      (if (:sci.impl/macroexpanding ctx)
-                        res
-                        (analyze ctx res)))
-                doseq (analyze ctx (expand-doseq ctx expr))
-                if (expand-if ctx expr)
-                case (expand-case ctx expr)
-                try (expand-try ctx expr)
-                declare (expand-declare ctx expr)
-                expand-dot* (expand-dot* ctx expr)
-                . (expand-dot** ctx expr)
-                expand-constructor (expand-constructor ctx expr)
-                new (expand-new ctx expr)
-                ns (analyze-ns-form ctx expr)
-                var (analyze-var ctx expr)
-                set! (analyze-set! ctx expr)
-                (import quote) (mark-eval-call expr) ;; don't analyze children
-                ;; TODO: analyze if recur occurs in tail position, see #498
-                ;; recur (mark-eval-call (cons f (analyze-children ctx (rest expr))))
-                ;; else
-                or (return-or expr (analyze-children ctx (rest expr)))
-                and (return-and expr (analyze-children ctx (rest expr)))
-                recur (return-recur expr (analyze-children ctx (rest expr)))
-                (mark-eval-call (cons f (analyze-children ctx (rest expr)))))
-              :else
-              (try
-                (if (macro? f)
-                  (let [needs-ctx? (identical? utils/needs-ctx
-                                               (:sci.impl/op (meta f)))
-                        v (if needs-ctx?
-                            (apply f expr
-                                   (:bindings ctx)
-                                   ctx
-                                   (rest expr))
-                            (apply f expr
-                                   (:bindings ctx) (rest expr)))
-                        expanded (cond (:sci.impl/macroexpanding ctx) v
-                                       (and top-level? (seq? v) (= 'do (first v)))
-                                       ;; hand back control to eval-form for
-                                       ;; interleaved analysis and eval
-                                       (types/->EvalForm v)
-                                       :else (analyze ctx v))]
-                    expanded)
-                  (if-let [f (:sci.impl/inlined f-meta)]
-                    (return-call ctx
-                                   ;; for backwards compatibility with error reporting
-                                   (mark-eval-call (cons f (rest expr))
-                                                   :sci.impl/f-meta f-meta)
-                                   f (analyze-children ctx (rest expr)))
-                    (if-let [op (:sci.impl/op (meta f))]
-                      (cond
-                        (identical? utils/needs-ctx op)
-                        (return-needs-ctx-call ctx
-                                           ;; no need to pass metadata for backwards compatibility
-                                           ;; since we weren't reporting needs-ctx-fns anyway
-                                           expr
-                                           f (analyze-children ctx (rest expr)))
-                        (kw-identical? :resolve-sym op)
-                        (return-binding-call ctx
-                                       ;; for backwards compatibility with error reporting
-                                       (mark-eval-call (cons f (rest expr))
-                                                       :sci.impl/f-meta f-meta)
-                                       f (analyze-children ctx (rest expr)))
-                        :else
-                        (mark-eval-call (cons f (analyze-children ctx (rest expr)))))
-                      (let [children (analyze-children ctx (rest expr))]
+          (let [;; in call position Clojure prioritizes special symbols over
+                ;; bindings
+                special-sym (get special-syms f)
+                _ (when (and special-sym
+                             (:check-permissions ctx))
+                    (resolve/check-permission! ctx f [special-sym nil]))
+                f (or special-sym
+                      (resolve/resolve-symbol ctx f true))
+                f-meta (meta f)
+                eval? (and f-meta (:sci.impl/op f-meta))]
+            (cond (and f-meta (::static-access f-meta))
+                  #?(:clj (expand-dot** ctx (list* '. (first f) (second f) (rest expr)))
+                     :cljs
+                     (let [children (analyze-children ctx (rest expr))]
+                       (ctx-fn (fn [ctx]
+                                 (eval/eval-static-method-invocation ctx (cons f children)))
+                               expr)))
+                  (and (not eval?) ;; the symbol is not a binding
+                       (or
+                        special-sym
+                        (contains? ana-macros f)))
+                  (case f
+                    ;; we treat every subexpression of a top-level do as a separate
+                    ;; analysis/interpretation unit so we hand this over to the
+                    ;; interpreter again, which will invoke analysis + evaluation on
+                    ;; every sub expression
+                    do (return-do expr (analyze-children ctx (rest expr)))
+                    let (expand-let ctx expr)
+                    (fn fn*) (expand-fn ctx expr false)
+                    def (expand-def ctx expr)
+                    ;; NOTE: defn / defmacro aren't implemented as normal macros yet
+                    (defn defmacro) (let [ret (expand-defn ctx expr)]
+                                      ret)
+                    ;; TODO: implement as normal macro in namespaces.cljc
+                    loop (expand-loop ctx expr)
+                    lazy-seq (analyze-lazy-seq ctx expr)
+                    for (let [res (expand-for ctx expr)]
+                          (if (:sci.impl/macroexpanding ctx)
+                            res
+                            (analyze ctx res)))
+                    doseq (analyze ctx (expand-doseq ctx expr))
+                    if (return-if ctx expr)
+                    case (analyze-case ctx expr)
+                    try (analyze-try ctx expr)
+                    throw (analyze-throw ctx expr)
+                    declare (expand-declare ctx expr)
+                    expand-dot* (expand-dot* ctx expr)
+                    . (expand-dot** ctx expr)
+                    expand-constructor (expand-constructor ctx expr)
+                    new (analyze-new ctx expr)
+                    ns (analyze-ns-form ctx expr)
+                    var (analyze-var ctx expr)
+                    set! (analyze-set! ctx expr)
+                    quote (analyze-quote ctx expr)
+                    import (analyze-import ctx expr)
+                    ;; TODO: analyze if recur occurs in tail position, see #498
+                    ;; recur (mark-eval-call (cons f (analyze-children ctx (rest expr))))
+                    ;; else
+                    or (return-or expr (analyze-children ctx (rest expr)))
+                    and (return-and expr (analyze-children ctx (rest expr)))
+                    recur (return-recur expr (analyze-children ctx (rest expr)))
+                    in-ns (analyze-in-ns ctx expr)
+                    (mark-eval-call (cons f (analyze-children ctx (rest expr)))))
+                  :else
+                  (try
+                    (if (macro? f)
+                      (let [needs-ctx? (identical? utils/needs-ctx
+                                                   (:sci.impl/op (meta f)))
+                            v (if needs-ctx?
+                                (apply f expr
+                                       (:bindings ctx)
+                                       ctx
+                                       (rest expr))
+                                (apply f expr
+                                       (:bindings ctx) (rest expr)))
+                            expanded (cond (:sci.impl/macroexpanding ctx) v
+                                           (and top-level? (seq? v) (= 'do (first v)))
+                                           ;; hand back control to eval-form for
+                                           ;; interleaved analysis and eval
+                                           (types/->EvalForm v)
+                                           :else (analyze ctx v))]
+                        expanded)
+                      (if-let [f (:sci.impl/inlined f-meta)]
                         (return-call ctx
-                                       ;; for backwards compatibility with error reporting
-                                       (mark-eval-call (cons f children)
-                                                       :sci.impl/f-meta f-meta)
-                                       f children)))))
-                (catch #?(:clj Exception :cljs js/Error) e
-                  (rethrow-with-location-of-node ctx e
-                                                 ;; adding metadata for error reporting
-                                                 (mark-eval-call
-                                                  (with-meta (cons f (rest expr))
-                                                    (meta expr))))))))
-      (keyword? f)
-      (let [children (analyze-children ctx (rest expr))]
-        (case (count children)
-          1 (let [arg (nth children 0)]
-              (ctx-fn
-               (fn [ctx]
-                 ;; (prn :f f :arg (eval/eval ctx arg))
-                 (f (eval/eval ctx arg)))
-               expr))
-          2 (let [arg0 (nth children 0)
-                  arg1 (nth children 1)]
-              (ctx-fn (fn [ctx]
-                        (f (eval/eval ctx arg0)
-                           (eval/eval ctx arg1)))
-                      expr))
-          (mark-eval-call (cons f children))))
-      ;; (fn? f)
-      ;; TODO: how is this state reached? Maybe via a user-defined macro.
-      :else
-      (let [ret (mark-eval-call (analyze-children ctx expr))]
-        ret))))
+                                     ;; for backwards compatibility with error reporting
+                                     (mark-eval-call (cons f (rest expr))
+                                                     :sci.impl/f-meta f-meta)
+                                     f (analyze-children ctx (rest expr)))
+                        (if-let [op (:sci.impl/op (meta f))]
+                          (cond
+                            (identical? utils/needs-ctx op)
+                            (return-needs-ctx-call ctx
+                                                   ;; no need to pass metadata for backwards compatibility
+                                                   ;; since we weren't reporting needs-ctx-fns anyway
+                                                   expr
+                                                   f (analyze-children ctx (rest expr)))
+                            (kw-identical? :resolve-sym op)
+                            (return-binding-call ctx
+                                                 ;; for backwards compatibility with error reporting
+                                                 (mark-eval-call (cons f (rest expr))
+                                                                 :sci.impl/f-meta f-meta)
+                                                 f (analyze-children ctx (rest expr)))
+                            :else
+                            (mark-eval-call (cons f (analyze-children ctx (rest expr)))))
+                          (let [children (analyze-children ctx (rest expr))]
+                            (return-call ctx
+                                         ;; for backwards compatibility with error reporting
+                                         (mark-eval-call (cons f children)
+                                                         :sci.impl/f-meta f-meta)
+                                         f children)))))
+                    (catch #?(:clj Exception :cljs js/Error) e
+                      (rethrow-with-location-of-node ctx e
+                                                     ;; adding metadata for error reporting
+                                                     (mark-eval-call
+                                                      (with-meta (cons f (rest expr))
+                                                        (meta expr))))))))
+          (keyword? f)
+          (let [children (analyze-children ctx (rest expr))
+                ccount (count children)]
+            (case ccount
+              1 (let [arg (nth children 0)]
+                  (ctx-fn
+                   (fn [ctx]
+                     (f (eval/eval ctx arg)))
+                   expr))
+              2 (let [arg0 (nth children 0)
+                      arg1 (nth children 1)]
+                  (ctx-fn (fn [ctx]
+                            (f (eval/eval ctx arg0)
+                               (eval/eval ctx arg1)))
+                          expr))
+              (throw-error-with-location (str "Wrong number of args (" ccount ") passed to: " f) expr)))
+          :else
+          (let [f (analyze ctx f)
+                children (analyze-children ctx (rest expr))]
+            (ctx-fn (fn [ctx]
+                      (let [f (eval/eval ctx f)]
+                        (if (ifn? f)
+                          (eval/fn-call ctx f children)
+                          (throw (new #?(:clj Exception :cljs js/Error)
+                                      (str "Cannot call " (pr-str f) " as a function."))))))
+                    (mark-eval-call (cons f children)))))))
 
 (def ^:const constant-colls true) ;; see GH #452
+
+(defn return-map [ctx the-map]
+  (let [children (into [] cat the-map)
+        analyzed-children (analyze-children ctx children)]
+    (if (<= (count analyzed-children) 16)
+      (return-call ctx the-map array-map analyzed-children)
+      (return-call ctx the-map hash-map analyzed-children))))
+
+(defn analyze-map
+  [ctx expr m]
+  (let [ks (keys expr)
+        vs (vals expr)
+        constant-map? (and constant-colls
+                           (every? constant? ks)
+                           (every? constant? vs))
+        analyzed-map (cond constant-map?
+                           expr
+                           ;; potential place for optimization
+                           (not (:meta ctx))
+                           (return-map ctx expr)
+                           :else
+                           (zipmap (analyze-children ctx ks)
+                                   (analyze-children ctx vs)))
+        analyzed-meta (when m (analyze (assoc ctx :meta true) m))
+        analyzed-meta (if (and constant-map?
+                               ;; meta was also a constant-map
+                               (identical? m analyzed-meta))
+                        analyzed-meta
+                        (assoc analyzed-meta :sci.impl/op :eval))
+        ret (if analyzed-meta
+              (if (instance? #?(:clj sci.impl.types.EvalFn
+                                :cljs sci.impl.types/EvalFn)
+                             analyzed-map)
+                (ctx-fn
+                 (fn [ctx]
+                   (let [md (eval/handle-meta ctx analyzed-meta)
+                         coll (eval/eval ctx analyzed-map)]
+                     (with-meta coll md)))
+                 expr)
+                (with-meta analyzed-map analyzed-meta))
+              analyzed-map)]
+    ret))
+
+(defn analyze-vec-or-set
+  "Returns analyzed vector or set"
+  [ctx _f1 f2 expr m]
+  (let [constant-coll?
+        (and constant-colls
+             (every? constant? expr))
+        analyzed-meta (when m (analyze ctx #_(assoc ctx :meta true) m))
+        must-eval (or (not constant-coll?)
+                      (not (identical? m analyzed-meta)))
+        analyzed-coll (if (not must-eval)
+                        expr
+                        (if m
+                          ;; can we transform this into return-call?
+                          (let [ef (return-call ctx expr f2 (analyze-children ctx expr))]
+                            (ctx-fn
+                             (fn [ctx]
+                               (let [md (eval/eval ctx analyzed-meta)
+                                     coll (eval/eval ctx ef)]
+                                 (with-meta coll md)))
+                             expr))
+                          (return-call ctx expr f2 (analyze-children ctx expr))))]
+    analyzed-coll))
 
 (defn analyze
   ([ctx expr]
    (analyze ctx expr false))
   ([ctx expr top-level?]
-   ;; (prn :ana expr)
-   (let [m (meta expr)
-         ret (cond (constant? expr) expr ;; constants do not carry metadata
-                   (symbol? expr) (let [v (resolve/resolve-symbol ctx expr false)]
-                                    (cond (constant? v) v
-                                          (vars/var? v)
-                                          (if (:const (meta v))
-                                            @v
-                                            (if (vars/isMacro v)
-                                              (throw (new #?(:clj IllegalStateException :cljs js/Error)
-                                                          (str "Can't take value of a macro: " v "")))
-                                              (types/->EvalVar v)))
-                                          :else (merge-meta v m)))
-                   ;; don't evaluate records, this check needs to go before map?
-                   ;; since a record is also a map
-                   (record? expr) expr
-                   (map? expr)
-                   (let [ks (keys expr)
-                         vs (vals expr)
-                         constant-map? (and constant-colls
-                                            (every? constant? ks)
-                                            (every? constant? vs))
-                         analyzed-map (if constant-map?
-                                        expr
-                                        ;; potential place for optimization
-                                        (zipmap (analyze-children ctx ks)
-                                                (analyze-children ctx vs)))
-                         analyzed-meta (when m (analyze ctx m))
-                         analyzed-meta (if (and constant-map?
-                                                ;; meta was also a constant-map
-                                                (identical? m analyzed-meta))
-                                         analyzed-meta
-                                         (assoc analyzed-meta :sci.impl/op :eval))]
-                     (if analyzed-meta
-                       (with-meta analyzed-map analyzed-meta)
-                       analyzed-map))
-                   (or (vector? expr) (set? expr))
-                   (let [constant-coll? (and constant-colls
-                                             (every? constant? expr))
-                         analyzed-coll (if constant-coll?
-                                         expr
-                                         (into (empty expr) (analyze-children ctx expr)))
-                         analyzed-meta (when m (analyze ctx m))
-                         analyzed-meta (if (and constant-coll?
-                                                (identical? m analyzed-meta))
-                                         analyzed-meta
-                                         (assoc analyzed-meta :sci.impl/op :eval))]
-                     (if analyzed-meta
-                       (with-meta analyzed-coll analyzed-meta)
-                       analyzed-coll))
-                   (seq? expr) (if (seq expr)
-                                 (merge-meta (analyze-call ctx expr top-level?) m)
-                                 ;; the empty list
-                                 expr)
-                   :else
-                   expr)]
-     ret)))
+   ;; (prn :ana expr (:meta ctx))
+   (let [m (meta expr)]
+     (cond
+       (constant? expr) expr ;; constants do not carry metadata
+       (symbol? expr) (let [v (resolve/resolve-symbol ctx expr false)]
+                        (cond (constant? v) v
+                              (vars/var? v)
+                              (if (:const (meta v))
+                                @v
+                                (if (vars/isMacro v)
+                                  (throw (new #?(:clj IllegalStateException :cljs js/Error)
+                                              (str "Can't take value of a macro: " v "")))
+                                  (types/->EvalVar v)))
+                              :else (merge-meta v m)))
+       ;; don't evaluate records, this check needs to go before map?
+       ;; since a record is also a map
+       (record? expr) expr
+       (map? expr) (analyze-map ctx expr m)
+       (vector? expr) (analyze-vec-or-set ctx
+                                          ;; relying on analyze-children to
+                                          ;; return a vector
+                                          identity
+                                          vector expr m)
+       (set? expr) (analyze-vec-or-set ctx set hash-set expr m)
+       (seq? expr) (if (seq expr)
+                     (merge-meta (analyze-call ctx expr top-level?) m)
+                     ;; the empty list
+                     expr)
+       :else
+       expr))))
 
 ;;;; Scratch
 
 (comment
+  ;; _ctx expr f analyzed-children
   )

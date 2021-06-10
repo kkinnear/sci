@@ -112,6 +112,29 @@
                               (binding [x (inc x)]
                                 @(future (binding [x (inc x)] @(future (binding [x (inc x)] x)))))"
                            (addons/future {})))))))
+
+#?(:clj
+   (when-not tu/native?
+     (deftest bound-fn-test
+       (is (= :hello (tu/eval* "
+(def ^:dynamic *some-var* nil)
+(def state (promise))
+(defn f [] (deliver state *some-var*))
+
+(binding [*some-var* :hello]
+  (.start (java.lang.Thread. (bound-fn* f))))
+@state"
+                               {:classes {'java.lang.Thread java.lang.Thread}})))
+       (is (= :hello (tu/eval* "
+(def ^:dynamic *some-var* nil)
+(def state (promise))
+(defn f [] (deliver state *some-var*))
+
+(binding [*some-var* :hello]
+  (.start (java.lang.Thread. (bound-fn [] (f)))))
+@state"
+                               {:classes {'java.lang.Thread java.lang.Thread}}))))))
+
 #?(:clj
    (deftest with-bindings-test
      (is (= 6 (eval* "
@@ -144,7 +167,6 @@
         (is (str/includes? (str/lower-case (str @x)) "unbound")))
       (is (thrown-with-msg? #?(:clj Throwable :cljs js/Error) #"1 is not a var"
                             (sci/with-redefs [1 1])))))
-
 
 #?(:clj
    (deftest pmap-test
@@ -225,3 +247,8 @@
        #"vector"
        (sci/eval-string
         "(with-local-vars #{x 1} (+ 1 (var-get x)))"))))
+
+(deftest thread-bound?-test
+  (is (false? (eval* "(def ^:dynamic *x*) (def ^:dynamic *y*) (thread-bound? #'*x* #'*x*)")))
+  (is (true? (eval* "(def ^:dynamic *x*) (def ^:dynamic *y*)
+    (binding [*x* *x* *y* *y*] (thread-bound? #'*x* #'*x*))"))))

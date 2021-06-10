@@ -4,16 +4,13 @@
   (:require
    [clojure.string :as str]
    [sci.impl.faster :as faster :refer [get-2 deref-1]]
-   [sci.impl.fns :as fns]
    [sci.impl.interop :as interop]
    [sci.impl.macros :as macros]
    [sci.impl.records :as records]
-   [sci.impl.types :as t]
+   [sci.impl.types]
    [sci.impl.utils :as utils :refer [throw-error-with-location
                                      rethrow-with-location-of-node
-                                     set-namespace!
-                                     kw-identical?
-                                     ]]
+                                     kw-identical?]]
    [sci.impl.vars :as vars])
   #?(:cljs (:require-macros [sci.impl.evaluator :refer [def-fn-call resolve-symbol]])))
 
@@ -22,10 +19,8 @@
 #?(:clj (set! *warn-on-reflection* true))
 
 (def #?(:clj ^:const macros :cljs macros)
-  '#{do and or quote fn def defn
-     lazy-seq try syntax-quote case . in-ns set!
-     ;; TODO: make normal function
-     require})
+  '#{do fn def defn
+     syntax-quote})
 
 ;;;; Evaluation
 
@@ -81,19 +76,6 @@
           (if nexprs (recur nexprs)
               ret))))))
 
-(defn eval-if
-  [ctx cond then else]
-  (if (eval ctx cond)
-    (eval ctx then)
-    (eval ctx else)))
-
-;; user> (time (dotimes [i 1000000] (let [expr '(1 2 3) cond (first expr) expr (rest expr) then (first expr) expr (rest expr) else (first expr)] [cond then else])))
-;; "Elapsed time: 119.671576 msecs"
-;; nil
-;; user> (time (dotimes [i 1000000] (let [[cond then else] '(1 2 3)] [cond then else])))
-;; "Elapsed time: 744.034037 msecs"
-;; nil
-
 (defn eval-def
   [ctx var-name init]
   (let [init (eval ctx init)
@@ -128,198 +110,41 @@
 
 (declare eval-string*)
 
-(defn handle-refer-all [the-current-ns the-loaded-ns include-sym? rename-sym only]
-  (let [only (when only (set only))]
-    (reduce (fn [ns [k v]]
-              (if (and (symbol? k) (include-sym? k)
-                       (or (not only)
-                           (contains? only k)))
-                (assoc ns (rename-sym k) v)
-                ns))
-            the-current-ns
-            the-loaded-ns)))
-
-(defn handle-require-libspec-env
-  [ctx env current-ns the-loaded-ns lib-name
-   {:keys [:as :refer :rename :exclude :only :use] :as _parsed-libspec}]
-  (let [the-current-ns (get-in env [:namespaces current-ns]) ;; = ns-data?
-        the-current-ns (if as (assoc-in the-current-ns [:aliases as] lib-name)
-                           the-current-ns)
-        rename-sym (if rename (fn [sym] (or (rename sym) sym))
-                       identity)
-        include-sym? (if exclude
-                       (let [excludes (set exclude)]
-                         (fn [sym]
-                           (not (contains? excludes sym))))
-                       (constantly true))
-        the-current-ns
-        (cond refer
-              (cond (or (kw-identical? :all refer)
-                        use)
-                    (handle-refer-all the-current-ns the-loaded-ns include-sym? rename-sym nil)
-                    (sequential? refer)
-                    (reduce (fn [ns sym]
-                              (if (include-sym? sym)
-                                (assoc ns (rename-sym sym)
-                                       (if-let [[_k v] (find the-loaded-ns sym)]
-                                         v
-                                         (when-not (:uberscript ctx)
-                                           (throw (new #?(:clj Exception :cljs js/Error)
-                                                       (str sym " does not exist"))))))
-                                ns))
-                            the-current-ns
-                            refer)
-                    :else (throw (new #?(:clj Exception :cljs js/Error)
-                                      (str ":refer value must be a sequential collection of symbols"))))
-              use (handle-refer-all the-current-ns the-loaded-ns include-sym? rename-sym only)
-              :else the-current-ns)
-        env (assoc-in env [:namespaces current-ns] the-current-ns)]
-    (when-let [on-loaded (some-> the-loaded-ns :obj meta :sci.impl/required-fn)]
-      (on-loaded {}))
-    env))
-
-(defn handle-require-libspec
-  [ctx lib opts]
-  (let [{:keys [:reload]} opts
-        env* (:env ctx)
-        env @env* ;; NOTE: loading namespaces is not (yet) thread-safe
-        cnn (vars/current-ns-name)
-        namespaces (get env :namespaces)
-        uberscript (:uberscript ctx)
-        reload* (or reload uberscript)]
-    (if-let [the-loaded-ns (when-not reload* (get namespaces lib))]
-      (reset! env* (handle-require-libspec-env ctx env cnn the-loaded-ns lib opts))
-      (if-let [load-fn (:load-fn env)]
-        (if-let [{:keys [:file :source]} (load-fn {:namespace lib
-                                                   :reload reload})]
-          (do
-            (try (vars/with-bindings
-                   {vars/current-ns @vars/current-ns
-                    vars/current-file file}
-                   (@utils/eval-string* (assoc ctx :bindings {}) source))
-                 (catch #?(:clj Exception :cljs js/Error) e
-                   (swap! env* update :namespaces dissoc lib)
-                   (throw e)))
-            (swap! env* (fn [env]
-                          (let [namespaces (get env :namespaces)
-                                the-loaded-ns (get namespaces lib)]
-                            (handle-require-libspec-env ctx env cnn
-                                                        the-loaded-ns
-                                                        lib opts)))))
-          (or (when reload*
-                (when-let [the-loaded-ns (get namespaces lib)]
-                  (reset! env* (handle-require-libspec-env ctx env cnn the-loaded-ns lib opts))))
-              (throw (new #?(:clj Exception :cljs js/Error)
-                          (str "Could not find namespace: " lib ".")))))
-        (throw (new #?(:clj Exception :cljs js/Error)
-
-                    (str "Could not find namespace " lib ".")))))))
-
-(defn load-lib [ctx prefix lib & options]
-  (when (and prefix (pos? (.indexOf (name lib) #?(:clj (int \.)
-                                                  :cljs \.))))
-    (throw-error-with-location (str "Found lib name '" (name lib) "' containing period with prefix '"
-                                    prefix "'.  lib names inside prefix lists must not contain periods")
-                               lib))
-  (let [lib (if prefix (symbol (str prefix \. lib)) lib)
-        opts (apply hash-map options)]
-    (handle-require-libspec ctx lib opts)))
-
-(defn- prependss
-  "Prepends a symbol or a seq to coll"
-  [x coll]
-  (if (symbol? x)
-    (cons x coll)
-    (concat x coll)))
-
-(defn- libspec?
-  "Returns true if x is a libspec"
-  [x]
-  (or (symbol? x)
-      (and (vector? x)
-           (or
-            (nil? (second x))
-            (keyword? (second x))))))
-
-(defn- load-libs
-  "Loads libs, evaling libspecs, prefix lists, and flags for
-  forwarding to load-lib"
-  [ctx kw args]
-  (let [args* (cons kw args)
-        flags (filter keyword? args*)
-        opts (interleave flags (repeat true))
-        args* (filter (complement keyword?) args*)]
-    ;; check for unsupported options
-    (let [supported #{:as :reload :reload-all :require :use :verbose :refer}
-          unsupported (seq (remove supported flags))]
-      (when unsupported
-        (throw-error-with-location (apply str "Unsupported option(s) supplied: "
-                                          (interpose \, unsupported))
-                                   ;; best effort location
-                                   args)))
-    ;; check a load target was specified
-    (when-not (seq args*)
-      (throw-error-with-location "Nothing specified to load"
-                                 args))
-    (doseq [arg args*]
-      (if (libspec? arg)
-        (apply load-lib ctx nil (prependss arg opts))
-        (let [[prefix & args*] arg]
-          (when (nil? prefix)
-            (throw-error-with-location "prefix cannot be nil"
-                                       args))
-          (doseq [arg args*]
-            (apply load-lib ctx prefix (prependss arg opts))))))))
-
-(defn eval-require
-  [ctx & args]
-  (load-libs ctx :require args))
-
-(vreset! utils/eval-require-state eval-require)
-
-(defn eval-use
-  [ctx & args]
-  (load-libs ctx :use args))
-
-(vreset! utils/eval-use-state eval-use)
-
 (defn eval-case
-  [ctx [_case {:keys [:case-map :case-val :case-default]}]]
-  (let [v (eval ctx case-val)]
-    (if-let [[_ found] (find case-map v)]
-      (eval ctx found)
-      (if (vector? case-default)
-        (eval ctx (second case-default))
-        (throw (new #?(:clj Exception :cljs js/Error)
-                    (str "No matching clause: " v)))))))
+  ([ctx case-map case-val]
+   (let [v (eval ctx case-val)]
+     (if-let [[_ found] (find case-map v)]
+       (eval ctx found)
+       (throw (new #?(:clj IllegalArgumentException :cljs js/Error)
+                   (str "No matching clause: " v))))))
+  ([ctx case-map case-val case-default]
+   (let [v (eval ctx case-val)]
+     (if-let [[_ found] (find case-map v)]
+       (eval ctx found)
+       (eval ctx case-default)))))
 
 (defn eval-try
-  [ctx expr]
-  (let [{:keys [:body :catches :finally]} (:sci.impl/try expr)]
-    (try
-      (binding [utils/*in-try* true]
-        (eval ctx body))
-      (catch #?(:clj Throwable :cljs js/Error) e
-        (if-let
-            [[_ r]
-             (reduce (fn [_ c]
-                       (let [clazz (:class c)]
-                         (when (instance? clazz e)
-                           (reduced
-                            [::try-result
-                             (eval (assoc-in ctx [:bindings (:binding c)]
-                                             e)
-                                   (:body c))]))))
-                     nil
-                     catches)]
-          r
-          (rethrow-with-location-of-node ctx e body)))
-      (finally
-        (eval ctx finally)))))
-
-(defn eval-throw [ctx [_throw ex]]
-  (let [ex (eval ctx ex)]
-    (throw ex)))
+  [ctx body catches finally]
+  (try
+    (binding [utils/*in-try* true]
+      (eval ctx body))
+    (catch #?(:clj Throwable :cljs js/Error) e
+      (if-let
+          [[_ r]
+           (reduce (fn [_ c]
+                     (let [clazz (:class c)]
+                       (when (instance? clazz e)
+                         (reduced
+                          [::try-result
+                           (eval (assoc-in ctx [:bindings (:binding c)]
+                                           e)
+                                 (:body c))]))))
+                   nil
+                   catches)]
+        r
+        (rethrow-with-location-of-node ctx e body)))
+    (finally
+      (eval ctx finally))))
 
 ;;;; Interop
 
@@ -328,17 +153,13 @@
                                 ;; eval args!
                                 (map #(eval ctx %) (rest expr))))
 
-(defn eval-constructor-invocation [ctx [_new #?(:clj class :cljs constructor) args]]
-  (let [args (map #(eval ctx %) args)] ;; eval args!
-    (interop/invoke-constructor #?(:clj class :cljs constructor) args)))
-
 #?(:clj
    (defn super-symbols [clazz]
      ;; (prn clazz '-> (map #(symbol (.getName ^Class %)) (supers clazz)))
      (map #(symbol (.getName ^Class %)) (supers clazz))))
 
-(defn eval-instance-method-invocation [{:keys [:class->opts] :as ctx}
-                                       [_dot instance-expr method-str args :as _expr]]
+(defn eval-instance-method-invocation
+  [ctx instance-expr method-str args]
   (let [instance-meta (meta instance-expr)
         tag-class (:tag-class instance-meta)
         instance-expr* (eval ctx instance-expr)]
@@ -349,6 +170,7 @@
             instance-class-name #?(:clj (.getName ^Class instance-class)
                                    :cljs (.-name instance-class))
             instance-class-symbol (symbol instance-class-name)
+            class->opts (:class->opts ctx)
             allowed? (or
                       (get class->opts :allow)
                       (get class->opts instance-class-symbol))
@@ -365,35 +187,6 @@
 ;;;; End interop
 
 ;;;; Namespaces
-
-(defn eval-in-ns [ctx [_in-ns ns-expr]]
-  (let [ns-sym (eval ctx ns-expr)]
-    (set-namespace! ctx ns-sym nil)
-    nil))
-
-(defn eval-refer [ctx ns-sym & exprs]
-  (let [ns-sym (eval ctx ns-sym)]
-    (loop [exprs exprs]
-      (when exprs
-        (let [[k v] exprs]
-          (case k
-            :exclude
-            (swap! (:env ctx)
-                   (fn [env]
-                     (let [cnn (vars/current-ns-name)]
-                       (update-in env [:namespaces cnn :refer ns-sym :exclude]
-                                  (fnil into #{}) v))))
-            :only
-            (swap! (:env ctx)
-                   (fn [env]
-                     (let [cnn (vars/current-ns-name)
-                           other-ns (get-in env [:namespaces ns-sym])
-                           other-vars (select-keys other-ns v)]
-                       (update-in env [:namespaces cnn]
-                                  merge other-vars)))))
-          (recur (nnext exprs)))))))
-
-(vreset! utils/eval-refer-state eval-refer)
 
 (declare eval-form)
 
@@ -451,13 +244,6 @@
 
 ;;;; End import
 
-(defn eval-set! [ctx [_ obj v]]
-  (let [obj (eval ctx obj)
-        v (eval ctx v)]
-    (if (vars/var? obj)
-      (t/setVal obj v)
-      (throw (ex-info (str "Cannot set " obj " to " v) {:obj obj :v v})))))
-
 (declare eval-string)
 
 (defn eval-do
@@ -511,60 +297,6 @@
 
 (def-fn-call)
 
-(defn eval-special-call [ctx f-sym expr]
-  (case (utils/strip-core-ns f-sym)
-    ;; do (eval-do ctx expr)
-    and (eval-and ctx (rest expr))
-    or (eval-or ctx (rest expr))
-    lazy-seq (new #?(:clj clojure.lang.LazySeq
-                     :cljs cljs.core/LazySeq)
-                  #?@(:clj []
-                      :cljs [nil])
-                  (eval ctx (second expr))
-                  #?@(:clj []
-                      :cljs [nil nil]))
-    ;; recur (fn-call ctx (comp fns/->Recur vector) (rest expr))
-    case (eval-case ctx expr)
-    try (eval-try ctx expr)
-    ;; interop
-    new (eval-constructor-invocation ctx expr)
-    . (eval-instance-method-invocation ctx expr)
-    throw (eval-throw ctx expr)
-    in-ns (eval-in-ns ctx expr)
-    set! (eval-set! ctx expr)
-    refer (apply eval-refer ctx (rest expr))
-    require (apply eval-require ctx (with-meta (rest expr)
-                                      (meta expr)))
-    use (apply eval-use ctx (with-meta (rest expr)
-                              (meta expr)))
-    ;; resolve works as a function so this should not be necessary
-    ;; resolve (eval-resolve ctx (second expr))
-    ;;macroexpand-1 (macroexpand-1 ctx (eval ctx (second expr)))
-    ;; macroexpand (macroexpand ctx (eval ctx (second expr)))
-    import (apply eval-import ctx (rest expr))
-    quote (second expr)))
-
-(defn eval-call [ctx expr]
-  (try (let [f (first expr)
-             eval? (instance? sci.impl.types.EvalFn f)
-             op (when-not eval?
-                  (some-> (meta f) (get-2 :sci.impl/op)))]
-         (cond
-           (and (symbol? f) (not op))
-           (eval-special-call ctx f expr)
-           (kw-identical? op :static-access)
-           (eval-static-method-invocation ctx expr)
-           :else
-           (let [f (if (or op eval?)
-                     (eval ctx f)
-                     f)]
-             (if (ifn? f)
-               (fn-call ctx f (rest expr))
-               (throw (new #?(:clj Exception :cljs js/Error)
-                           (str "Cannot call " (pr-str f) " as a function.")))))))
-       (catch #?(:clj Throwable :cljs js/Error) e
-         (rethrow-with-location-of-node ctx e expr))))
-
 (defn handle-meta [ctx m]
   ;; Sometimes metadata needs eval. In this case the metadata has metadata.
   (-> (if-let [mm (meta m)]
@@ -577,10 +309,12 @@
 (defn eval
   [ctx expr]
   (try
-    (cond (instance? sci.impl.types.EvalFn expr)
+    (cond (instance? #?(:clj sci.impl.types.EvalFn
+                        :cljs sci.impl.types/EvalFn) expr)
           (let [f (.-f ^sci.impl.types.EvalFn expr)]
             (f ctx))
-          (instance? sci.impl.types.EvalVar expr)
+          (instance? #?(:clj sci.impl.types.EvalVar
+                        :cljs sci.impl.types/EvalVar) expr)
           (let [v (.-v ^sci.impl.types.EvalVar expr)]
             (deref-1 v))
           :else
@@ -588,42 +322,22 @@
                 op (when m (get-2 m :sci.impl/op))
                 ret
                 (if
-                    (not op) expr
+                 (not op) expr
                     ;; TODO: moving this up increased performance for #246. We can
                     ;; probably optimize it further by not using separate keywords for
                     ;; one :sci.impl/op keyword on which we can use a case expression
-                    (case op
-                      :call (eval-call ctx expr)
-                      :try (eval-try ctx expr)
-                      :fn (let [fn-meta (:sci.impl/fn-meta expr)
-                                the-fn (fns/eval-fn ctx eval expr)
-                                fn-meta (when fn-meta (handle-meta ctx fn-meta))]
-                            (if fn-meta
-                              (vary-meta the-fn merge fn-meta)
-                              the-fn))
-                      :static-access (interop/get-static-field expr)
-                      :deref! (let [v (first expr)
-                                    v (if (vars/var? v) @v v)
-                                    v (force v)]
-                                v)
-                      :resolve-sym (resolve-symbol ctx expr)
-                      ;; needed for when a needs-ctx fn is passed as hof
-                      needs-ctx (if (identical? op utils/needs-ctx)
-                                  (partial expr ctx)
+                 (case op
+                   needs-ctx (if (identical? op utils/needs-ctx)
+                               (partial expr ctx)
                                   ;; this should never happen, or if it does, it's
                                   ;; someone trying to hack
-                                  (throw (new #?(:clj Exception :cljs js/Error)
-                                              (str "unexpected: " expr ", type: " (type expr), ", meta:" (meta expr)))))
-                      (cond (map? expr) (with-meta (zipmap (map #(eval ctx %) (keys expr))
-                                                           (map #(eval ctx %) (vals expr)))
-                                          (handle-meta ctx m))
-                            (or (vector? expr) (set? expr))
-                            (with-meta (into (empty expr)
-                                             (map #(eval ctx %)
-                                                  expr))
-                              (handle-meta ctx m))
-                            :else (throw (new #?(:clj Exception :cljs js/Error)
-                                              (str "unexpected: " expr ", type: " (type expr), ", meta:" (meta expr)))))))]
+                               (throw (new #?(:clj Exception :cljs js/Error)
+                                           (str "unexpected: " expr ", type: " (type expr), ", meta:" (meta expr)))))
+                   (cond (map? expr) (with-meta (zipmap (map #(eval ctx %) (keys expr))
+                                                        (map #(eval ctx %) (vals expr)))
+                                       (handle-meta ctx m))
+                         :else (throw (new #?(:clj Exception :cljs js/Error)
+                                           (str "unexpected: " expr ", type: " (type expr), ", meta:" (meta expr)))))))]
             ;; for debugging:
             ;; (prn :eval expr (meta expr) '-> ret (meta ret))
             ret))

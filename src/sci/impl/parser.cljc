@@ -36,6 +36,13 @@
                   (seq? obj)))
     :end-location false}))
 
+(defn var->sym [v]
+  (when-let [m (meta v)]
+    (when-let [var-name (:name m)]
+      (when-let [ns (:ns m)]
+        (symbol (str (vars/getName ns))
+                (str var-name))))))
+
 (defn fully-qualify [ctx sym]
   (let [env @(:env ctx)
         sym-ns (when-let [n (namespace sym)]
@@ -47,7 +54,12 @@
         the-current-ns (get namespaces current-ns)
         aliases (:aliases the-current-ns)
         ret (if-not sym-ns
-              (or (when (or (and (contains? (get namespaces 'clojure.core) sym)
+              (or (when-let [refers (:refers the-current-ns)]
+                    (when-let [v (get refers sym)]
+                      (var->sym v)))
+                  (when-let [v (get the-current-ns sym)]
+                    (var->sym v))
+                  (when (or (and (contains? (get namespaces 'clojure.core) sym)
                                  ;; only valid when the symbol isn't excluded
                                  (not (some-> the-current-ns
                                               :refer
@@ -57,12 +69,6 @@
                             (contains? utils/ana-macros sym))
                     (symbol "clojure.core" sym-name-str))
                   (interop/fully-qualify-class ctx sym)
-                  (when-let [v (get the-current-ns sym)]
-                    (when-let [m (meta v)]
-                      (when-let [var-name (:name m)]
-                        (when-let [ns (:ns m)]
-                          (symbol (str (vars/getName ns))
-                                  (str var-name))))))
                   ;; all unresolvable symbols all resolved in the current namespace
                   (symbol current-ns-str sym-name-str))
               (if (get-in env [:namespaces sym-ns])

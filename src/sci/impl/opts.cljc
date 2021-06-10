@@ -5,7 +5,9 @@
    [sci.impl.namespaces :as namespaces]
    [sci.impl.utils :as utils :refer [strip-core-ns]]
    [sci.impl.vars :as vars]
-   [sci.lang]))
+   [sci.impl.types :as types]
+   [sci.lang])
+  #?(:clj (:import [sci.impl.types IReified])))
 
 #?(:clj
    (defrecord Env [namespaces imports load-fn]))
@@ -23,7 +25,11 @@
                      namespaces (-> namespaces
                                     (update 'user assoc :aliases aliases)
                                     (update 'clojure.core assoc 'global-hierarchy
-                                            (vars/->SciVar (make-hierarchy) 'global-hierarchy nil false)))]
+                                            (vars/->SciVar (make-hierarchy) 'global-hierarchy nil false)))
+                     imports (if-let [env-imports (:imports env)]
+                               (merge env-imports imports)
+                               imports)]
+                 ;; TODO: is the first case ever hit?
                  (if-not env
                    #?(:clj (->Env namespaces imports load-fn)
                       :cljs {:namespaces namespaces
@@ -34,8 +40,8 @@
                           :imports imports
                           :load-fn load-fn))))))
 
-(defn process-permissions [& permissions]
-  (not-empty (into #{} (comp cat (map strip-core-ns)) permissions)))
+(defn process-permissions [prev-perms & permissions]
+  (not-empty (into prev-perms (comp cat (map strip-core-ns)) permissions)))
 
 (def default-classes
   #?(:clj {'java.lang.AssertionError AssertionError
@@ -86,23 +92,33 @@
       {:public-class (:public-class classes)
        :class->opts (persistent! class->opts)})))
 
-(def default-reify
-  #?(:clj {'#{java.lang.Object}
-           (fn [methods]
-             (reify Object
-               (toString [this]
-                 ((get-in methods '[java.lang.Object toString]) this))))}
-     :cljs {}))
+(def default-reify-fn
+  #?(:clj (fn [{:keys [interfaces methods protocols]}]
+            (reify
+              Object
+              (toString [this]
+                ((get methods 'toString) this))
+              IReified
+              (getInterfaces [this]
+                interfaces)
+              (getMethods [this]
+                methods)
+              (getProtocols [this]
+                protocols)))
+     :cljs (fn [_ _ _])))
 
 #?(:clj (defrecord Ctx [bindings env
-                        features readers]))
+                        features readers
+                        reload-all
+                        check-permissions]))
 
-(defn ->ctx [bindings env features readers]
+(defn ->ctx [bindings env features readers check-permissions?]
   #?(:cljs {:bindings bindings
             :env env
             :features features
-            :readers readers}
-     :clj (->Ctx bindings env features readers)))
+            :readers readers
+            :check-permissions check-permissions?}
+     :clj (->Ctx bindings env features readers false check-permissions?)))
 
 (defn init
   "Initializes options"
@@ -116,19 +132,51 @@
            :load-fn
            :uberscript ;; used by babashka, not public!
            :readers
-           :reify
+           :reify-fn
+           :proxy-fn
            :disable-arity-checks]}]
   (let [env (or env (atom {}))
         imports (merge default-imports imports)
         bindings bindings
         _ (init-env! env bindings aliases namespaces imports load-fn)
-        classes (normalize-classes (merge default-classes classes))
-        ctx (assoc (->ctx {} env features readers)
-                   :allow (process-permissions allow)
-                   :deny (process-permissions deny)
+        raw-classes classes
+        classes (normalize-classes (merge default-classes raw-classes))
+        ctx (assoc (->ctx {} env features readers (or allow deny))
+                   :allow (when allow (process-permissions #{} allow))
+                   :deny (when deny (process-permissions #{} deny))
                    :uberscript uberscript
-                   :reify (merge default-reify reify)
+                   :reify-fn (or reify-fn default-reify-fn)
+                   :proxy-fn proxy-fn
                    :disable-arity-checks disable-arity-checks
                    :public-class (:public-class classes)
+                   :raw-classes raw-classes ;; hold on for merge-opts
+                   :class->opts (:class->opts classes))]
+    ctx))
+
+(defn merge-opts [ctx opts]
+  (let [{:keys [:bindings
+                :allow :deny
+                :aliases
+                :namespaces
+                :classes
+                :imports
+                :features
+                :load-fn
+                :uberscript ;; used by babashka, not public!
+                :readers
+                :reify-fn
+                :disable-arity-checks]} opts
+        env (:env ctx)
+        _ (init-env! env bindings aliases namespaces imports load-fn)
+        raw-classes (merge (:raw-classes ctx) classes)
+        classes (normalize-classes raw-classes)
+        ctx (assoc (->ctx {} env features readers (or (:check-permissions ctx) allow deny))
+                   :allow (when allow (process-permissions (:allow ctx) allow))
+                   :deny (when deny (process-permissions (:deny ctx) deny))
+                   :uberscript uberscript
+                   :reify-fn reify-fn
+                   :disable-arity-checks disable-arity-checks
+                   :public-class (:public-class classes)
+                   :raw-classes raw-classes
                    :class->opts (:class->opts classes))]
     ctx))

@@ -29,6 +29,31 @@
   [(f/foo a) (f/foo b) (f/graph a) (satisfies? f/Graph a)])"]
       (is (= [0 3 {:from 1, :to 2} true] (tu/eval* prog {}))))))
 
+(deftest destructuring-protocol-fn-test
+  (let [prog "
+(defprotocol Foo (sayhello [_ name] \"print a name\"))
+(defrecord Greeter [state] Foo (sayhello [{:keys [state]} name] [state name]))
+(sayhello (Greeter. \"test\") \"john\")"]
+    (is (= ["test" "john"] (tu/eval* prog {})))))
+
+(deftest shadow-record-field-protocol-fn-test
+  (let [prog "
+(defprotocol Foo (sayhello [_ name] \"print a name\"))
+(defrecord Greeter [x y] Foo (sayhello [_ x] x))
+(sayhello (Greeter. \"x\" \"y\") \"john\")"]
+    (is (= "john" (tu/eval* prog {}))))
+  (let [prog "
+(defprotocol Foo (sayhello [_ name] \"print a name\"))
+(defrecord Greeter [x y] Foo (sayhello [x _] x))
+(sayhello (Greeter. \"x\" \"y\") \"john\")"]
+    (is (= {:x "x" :y "y"} (tu/eval* prog {}))))
+  (testing "protocol impl arg shadows this arg (the first one)"
+    (let [prog "
+(defprotocol Foo (sayhello [_ name] \"print a name\"))
+(defrecord Greeter [x y] Foo (sayhello [_ _] x))
+(sayhello (Greeter. \"x\" \"y\") \"john\")"]
+      (is (= "x" (tu/eval* prog {}))))))
+
 (deftest extends?-test
   (let [prog "
 (defprotocol Area (get-area [this]))

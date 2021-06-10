@@ -3,7 +3,8 @@
   (:refer-clojure :exclude [ex-message ex-cause eval read
                             read-string require
                             use load-string
-                            find-var *1 *2 *3 *e #?(:cljs type)])
+                            find-var *1 *2 *3 *e #?(:cljs type)
+                            bound-fn* with-bindings*])
   (:require
    #?(:clj [clojure.edn :as edn]
       :cljs [cljs.reader :as edn])
@@ -21,6 +22,7 @@
    [sci.impl.read :as read :refer [eval load-string read read-string]]
    [sci.impl.records :as records]
    [sci.impl.reify :as reify]
+   #?(:clj [sci.impl.proxy :as proxy])
    [sci.impl.types :as types]
    [sci.impl.utils :as utils :refer [needs-ctx]]
    [sci.impl.vars :as vars])
@@ -36,35 +38,45 @@
 (def inlined-vars
   '#{+' unchecked-remainder-int unchecked-subtract-int dec' short-array bit-shift-right aget = boolean bit-shift-left aclone dec < char unchecked-long unchecked-negate unchecked-inc-int floats pos? boolean-array alength bit-xor unsigned-bit-shift-right neg? unchecked-float num reduced? booleans int-array inc' <= -' * min get long double bit-and-not unchecked-add-int short quot unchecked-double longs unchecked-multiply-int int > unchecked-int unchecked-multiply unchecked-dec double-array float - byte-array zero? unchecked-dec-int rem nth nil? bit-and *' unchecked-add identical? unchecked-divide-int unchecked-subtract / bit-or >= long-array object-array doubles unchecked-byte unchecked-short float-array inc + aset chars ints bit-not byte max == count char-array compare shorts unchecked-negate-int unchecked-inc unchecked-char bytes})
 
+#?(:clj (def elide-vars (= "true" (System/getenv "SCI_ELIDE_VARS")))
+   ;; for self-hosted
+   :cljs (def elide-vars false))
+
 (macros/deftime
   ;; Note: self hosted CLJS can't deal with multi-arity macros so this macro is split in 2
   (defmacro copy-var
-    ([sym ns]
-     `(let [ns# ~ns
-            m# (-> (var ~sym) meta)
-            ns-name# (vars/getName ns#)
-            name# (:name m#)
-            name-sym# (symbol (str ns-name#) (str name#))
-            val# ~sym]
-        (vars/->SciVar val# name-sym# (cond->
-                                        {:doc (:doc m#)
-                                         :name name#
+        ([sym ns]
+         `(let [ns# ~ns
+                m# (-> (var ~sym) meta)
+                ns-name# (vars/getName ns#)
+                name# (:name m#)
+                name-sym# (symbol (str ns-name#) (str name#))
+                val# ~sym]
+            (vars/->SciVar val# name-sym# (cond->
+                                              {:doc (:doc m#)
+                                               :name name#
+                                               :arglists (:arglists m#)
+                                               :ns ns#
+                                               :sci.impl/built-in true}
+                                            (and (identical? clojure-core-ns ns#)
+                                                 (contains? inlined-vars name#))
+                                            (assoc :sci.impl/inlined val#))
+                           false))))
+      (defmacro copy-core-var
+        ([sym]
+         `(copy-var ~sym clojure-core-ns)
+         #_`(let [m# (-> (var ~sym) meta)]
+              (vars/->SciVar ~sym '~sym {:doc (:doc m#)
+                                         :name (:name m#)
                                          :arglists (:arglists m#)
-                                         :ns ns#
-                                         :sci.impl/built-in true}
-                                        (and (identical? clojure-core-ns ns#)
-                                             (contains? inlined-vars name#))
-                                        (assoc :sci.impl/inlined val#))
-                       false))))
-  (defmacro copy-core-var
-    ([sym]
-     `(copy-var ~sym clojure-core-ns)
-     #_`(let [m# (-> (var ~sym) meta)]
-          (vars/->SciVar ~sym '~sym {:doc (:doc m#)
-                                     :name (:name m#)
-                                     :arglists (:arglists m#)
-                                     :ns clojure-core-ns
-                                     :sci.impl/built-in true})))))
+                                         :ns clojure-core-ns
+                                         :sci.impl/built-in true}))))
+  (when elide-vars
+    #?(:clj
+       (binding [*out* *err*]
+         (println "SCI: eliding vars.")))
+    (defmacro copy-var [sym _ns] sym)
+    (defmacro copy-core-var [sym] sym)))
 
 (defn macrofy [f]
   (vary-meta f #(assoc % :sci/macro true)))
@@ -396,18 +408,21 @@
                    (vars/->SciNamespace sym nil))
                  (vals aliases)))))
 
+(defn clean-ns [m]
+  (dissoc m :aliases :imports :obj :refer :refers))
+
 (defn sci-ns-interns [ctx sci-ns]
   (let [sci-ns (sci-the-ns ctx sci-ns)
         name (sci-ns-name sci-ns)
         m (get-in @(:env ctx) [:namespaces name])
-        m (dissoc m :aliases :imports :obj)]
+        m (clean-ns m)]
     m))
 
 (defn sci-ns-publics [ctx sci-ns]
   (let [sci-ns (sci-the-ns ctx sci-ns)
         name (sci-ns-name sci-ns)
         m (get-in @(:env ctx) [:namespaces name])
-        m (dissoc m :aliases :imports :obj)]
+        m (clean-ns m)]
     (into {} (keep (fn [[k v]]
                      (when-not (:private (meta v))
                        [k v]))
@@ -428,11 +443,10 @@
   (let [sci-ns (sci-the-ns ctx sci-ns)
         name (sci-ns-name sci-ns)
         env @(:env ctx)
-        the-ns (get-in env [:namespaces name])
-        the-ns (dissoc the-ns :aliases :imports :obj)
+        refers (get-in env [:namespaces name :refers])
         clojure-core (get-in env [:namespaces 'clojure.core])
-        clojure-core (dissoc clojure-core :aliases :imports :obj)]
-    (merge the-ns clojure-core)))
+        clojure-core (clean-ns clojure-core)]
+    (merge clojure-core refers)))
 
 (defn sci-ns-map [ctx sci-ns]
   (merge (sci-ns-interns ctx sci-ns)
@@ -454,6 +468,8 @@
                                  (contains? (:imports the-ns-map) sym))
                                 ;; nil marks the imported class as unmapped
                                 (update the-ns-map :imports assoc sym nil)
+                                (contains? (:refers the-ns-map) sym)
+                                (update the-ns-map :refers dissoc sym)
                                 :else the-ns-map))))))
   nil)
 
@@ -516,6 +532,9 @@
 (defn sci-refer [sci-ctx & args]
   (apply @utils/eval-refer-state sci-ctx args))
 
+(defn sci-refer-clojure [_ _ & filters]
+  `(clojure.core/refer '~'clojure.core ~@filters))
+
 (defn sci-ns-resolve
   ([sci-ctx ns sym]
    (vars/with-bindings {vars/current-ns (sci-the-ns sci-ctx ns)}
@@ -552,24 +571,30 @@
 
 ;;;; Binding vars
 
+(defn with-bindings*
+  "Takes a map of Var/value pairs. Installs for the given Vars the associated
+  values as thread-local bindings. Then calls f with the supplied arguments.
+  Pops the installed bindings after f returned. Returns whatever f returns."
+  [binding-map f & args]
+  ;; important: outside try
+  (vars/push-thread-bindings binding-map)
+  (try
+    (apply f args)
+    (finally
+      (vars/pop-thread-bindings))))
+
 (defn sci-with-bindings
-  [_ _ bindings & body]
-  `(do
-     ;; important: outside try
-     (clojure.core/push-thread-bindings ~bindings)
-     (try
-       ~@body
-       (finally
-         (clojure.core/pop-thread-bindings)))))
+  [_ _ binding-map & body]
+  `(clojure.core/with-bindings* ~binding-map (fn [] ~@body)))
 
 (defn sci-binding
   [form _ bindings & body]
   (when-not (vector? bindings)
     (utils/throw-error-with-location (str "binding requires a vector for its bindings")
-                               form))
+                                     form))
   (when-not (even? (count bindings))
     (utils/throw-error-with-location (str "binding requires an even number of forms in binding vector")
-                               form))
+                                     form))
   (let [var-ize (fn [var-vals]
                   (loop [ret [] vvs (seq var-vals)]
                     (if vvs
@@ -583,6 +608,27 @@
          ~@body
          (finally
            (clojure.core/pop-thread-bindings))))))
+
+(defn bound-fn*
+  "Returns a function, which will install the same bindings in effect as in
+  the thread at the time bound-fn* was called and then call f with any given
+  arguments. This may be used to define a helper function which runs on a
+  different thread, but needs the same bindings in place."
+  [f]
+  (let [bindings (vars/get-thread-bindings)]
+    (fn [& args]
+      (apply with-bindings* bindings f args))))
+
+(defn sci-bound-fn
+  "Returns a function defined by the given fntail, which will install the
+  same bindings in effect as in the thread at the time bound-fn was called.
+  This may be used to define a helper function which runs on a different
+  thread, but needs the same bindings in place."
+  [_ _ & fntail]
+  `(clojure.core/bound-fn* (fn ~@fntail)))
+
+(defn sci-thread-bound? [& vars]
+  (every? #(vars/get-thread-binding %) vars))
 
 (defn sci-with-redefs-fn
   [binding-map func]
@@ -671,6 +717,26 @@
      (or (get (meta x) :type)
          (cljs.core/type x))))
 
+;;;; Clojure 1.11.0 kwargs
+
+#?(:clj (defmacro when-<-clojure-1.11.0 [& body]
+          (let [{:keys [:major :minor]} *clojure-version*]
+            (when-not (or (> major 1)
+                          (and (= major 1)
+                               (>= minor 11)))
+              `(do ~@body)))))
+
+#?(:clj
+   (when-<-clojure-1.11.0
+       (defn seq-to-map-for-destructuring
+         "Builds a map from a seq as described in
+  https://clojure.org/reference/special_forms#keyword-arguments"
+         {:added "1.11"}
+         [s]
+         (if (next s)
+           (clojure.lang.PersistentArrayMap/createAsIfByAssoc (to-array s))
+           (if (seq s) (first s) clojure.lang.PersistentArrayMap/EMPTY)))))
+
 (def clojure-core
   {:obj clojure-core-ns
    '*ns* vars/current-ns
@@ -742,6 +808,11 @@
             {:sci/macro true
              :sci.impl/op needs-ctx})
    'protocol-type-impl types/type-impl
+   #?@(:clj ['proxy* (with-meta proxy/proxy*
+                       {:sci.impl/op needs-ctx})
+             'proxy (with-meta proxy/proxy
+                      {:sci/macro true
+                       :sci.impl/op needs-ctx})])
    'satisfies? protocols/satisfies?
    ;; end protocols
    ;; IDeref as protocol
@@ -791,6 +862,14 @@
    'alter-var-root (copy-core-var vars/alter-var-root)
    'ancestors (with-meta hierarchies/ancestors* {:sci.impl/op needs-ctx})
    'aset (copy-core-var aset)
+   #?@(:clj ['aset-boolean (copy-core-var aset-boolean)
+             'aset-byte (copy-core-var aset-byte)
+             'aset-char (copy-core-var aset-char)
+             'aset-double (copy-core-var aset-double)
+             'aset-float (copy-core-var aset-float)
+             'aset-int (copy-core-var aset-int)
+             'aset-long (copy-core-var aset-long)
+             'aset-short (copy-core-var aset-short)])
    'alength #?(:clj (vars/->SciVar (fn [arr]
                                      (java.lang.reflect.Array/getLength arr))
                                    'alength nil false)
@@ -808,6 +887,7 @@
    'binding (with-meta sci-binding {:sci/macro true})
    'binding-conveyor-fn vars/binding-conveyor-fn
    'bit-and-not (copy-core-var bit-and-not)
+   #?@(:clj ['bit-clear (copy-core-var bit-clear)])
    'bit-set (copy-core-var bit-set)
    'bit-shift-left (copy-core-var bit-shift-left)
    'bit-shift-right (copy-core-var bit-shift-right)
@@ -820,6 +900,8 @@
    'bytes (copy-core-var bytes)
    'bit-test (copy-core-var bit-test)
    'bit-and (copy-core-var bit-and)
+   'bound-fn (macrofy sci-bound-fn)
+   'bound-fn* (copy-var bound-fn* clojure-core-ns)
    'bounded-count (copy-core-var bounded-count)
    'bit-or (copy-core-var bit-or)
    'bit-flip (copy-core-var bit-flip)
@@ -866,10 +948,12 @@
                 {:sci/macro true
                  :sci.impl/op needs-ctx})
    'delay (macrofy delay*)
+   'delay? (copy-core-var delay?)
    #?@(:clj ['deliver (copy-core-var deliver)])
    'derive (with-meta hierarchies/derive* {:sci.impl/op needs-ctx})
    'descendants (with-meta hierarchies/descendants* {:sci.impl/op needs-ctx})
    'dissoc (copy-core-var dissoc)
+   'dissoc! (copy-core-var dissoc!)
    'distinct (copy-core-var distinct)
    'distinct? (copy-core-var distinct?)
    'disj (copy-core-var disj)
@@ -913,6 +997,7 @@
    'frequencies (copy-core-var frequencies)
    'float (copy-core-var float)
    'fn? (copy-core-var fn?)
+   'force (copy-core-var force)
    'get (copy-core-var get)
    'get-thread-binding-frame-impl vars/get-thread-binding-frame
    #?@(:clj ['get-thread-bindings (copy-var vars/get-thread-bindings clojure-core-ns)])
@@ -1034,6 +1119,7 @@
    'quot (copy-core-var quot)
    're-seq (copy-core-var re-seq)
    'refer (with-meta sci-refer {:sci.impl/op needs-ctx})
+   'refer-clojure (macrofy sci-refer-clojure)
    're-find (copy-core-var re-find)
    #?@(:clj ['re-groups (copy-core-var re-groups)])
    're-pattern (copy-core-var re-pattern)
@@ -1085,11 +1171,13 @@
    'second (copy-core-var second)
    'set (copy-core-var set)
    'seq (copy-core-var seq)
+   #?@(:clj ['seq-to-map-for-destructuring (copy-var seq-to-map-for-destructuring clojure-core-ns)])
    'seq? (copy-core-var seq?)
    'short (copy-core-var short)
    'shuffle (copy-core-var shuffle)
    'sort (copy-core-var sort)
    'sort-by (copy-core-var sort-by)
+   'thread-bound? (copy-var sci-thread-bound? clojure-core-ns)
    'subs (copy-core-var subs)
    #?@(:clj ['supers (copy-core-var supers)])
    'symbol (copy-var symbol* clojure-core-ns)
@@ -1174,6 +1262,7 @@
    'when-not (macrofy when-not*)
    'while (macrofy while*)
    'with-bindings (macrofy sci-with-bindings)
+   'with-bindings* (copy-var with-bindings* clojure-core-ns)
    'with-local-vars (macrofy with-local-vars*)
    'with-meta (copy-core-var with-meta)
    'with-open (macrofy with-open*)
@@ -1240,7 +1329,7 @@
   [_ _ sym]
   `(if-let [var# (resolve '~sym)]
      (when (var? var#)
-           (~'clojure.repl/print-doc (meta var#)))
+       (~'clojure.repl/print-doc (meta var#)))
      (if-let [ns# (find-ns '~sym)]
        (~'clojure.repl/print-doc (assoc (meta ns#)
                                         :name (ns-name ns#))))))
@@ -1276,29 +1365,29 @@
                   (sci-all-ns ctx)))))
 
 #_(defn source-fn
-  "Returns a string of the source code for the given symbol, if it can
+    "Returns a string of the source code for the given symbol, if it can
   find it.  This requires that the symbol resolve to a Var defined in
   a namespace for which the .clj is in the classpath.  Returns nil if
   it can't find the source.  For most REPL usage, 'source' is more
   convenient.
 
   Example: (source-fn 'filter)"
-  [x]
-  (when-let [v (resolve x)]
-    (when-let [filepath (:file (meta v))]
-      (when-let [strm (.getResourceAsStream (RT/baseLoader) filepath)]
-        (with-open [rdr (LineNumberReader. (InputStreamReader. strm))]
-          (dotimes [_ (dec (:line (meta v)))] (.readLine rdr))
-          (let [text (StringBuilder.)
-                pbr (proxy [PushbackReader] [rdr]
-                      (read [] (let [i (proxy-super read)]
-                                 (.append text (char i))
-                                 i)))
-                read-opts (if (.endsWith ^String filepath "cljc") {:read-cond :allow} {})]
-            (if (= :unknown *read-eval*)
-              (throw (IllegalStateException. "Unable to read source while *read-eval* is :unknown."))
-              (read read-opts (PushbackReader. pbr)))
-            (str text)))))))
+    [x]
+    (when-let [v (resolve x)]
+      (when-let [filepath (:file (meta v))]
+        (when-let [strm (.getResourceAsStream (RT/baseLoader) filepath)]
+          (with-open [rdr (LineNumberReader. (InputStreamReader. strm))]
+            (dotimes [_ (dec (:line (meta v)))] (.readLine rdr))
+            (let [text (StringBuilder.)
+                  pbr (proxy [PushbackReader] [rdr]
+                        (read [] (let [i (proxy-super read)]
+                                   (.append text (char i))
+                                   i)))
+                  read-opts (if (.endsWith ^String filepath "cljc") {:read-cond :allow} {})]
+              (if (= :unknown *read-eval*)
+                (throw (IllegalStateException. "Unable to read source while *read-eval* is :unknown."))
+                (read read-opts (PushbackReader. pbr)))
+              (str text)))))))
 
 
 (defn source-fn

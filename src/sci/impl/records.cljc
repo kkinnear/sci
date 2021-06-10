@@ -5,35 +5,64 @@
             [sci.impl.utils :as utils]
             [sci.impl.vars :as vars]))
 
-(defn defrecord [_ _ ctx record-name fields & protocol-impls]
+#?(:clj
+   (defn assert-no-jvm-interface [protocol protocol-name expr]
+     (when (class? protocol)
+       (utils/throw-error-with-location
+        (str "Records currently only support protocol implementations, found: " protocol-name)
+        expr))))
+
+(defn defrecord [_form _ ctx record-name fields & raw-protocol-impls]
   (let [factory-fn-str (str "->" record-name)
         factory-fn-sym (symbol factory-fn-str)
         map-factory-sym (symbol (str "map" factory-fn-str))
         keys (mapv keyword fields)
         rec-type (symbol (str (vars/current-ns-name)) (str record-name))
-        protocol-impls (utils/split-when symbol? protocol-impls)
+        protocol-impls (utils/split-when symbol? raw-protocol-impls)
+        field-set (set fields)
         protocol-impls
-        (mapcat (fn [[protocol-name & impls]]
-                  (let [impls (group-by first impls)
-                        protocol (@utils/eval-resolve-state ctx protocol-name)
-                        protocol (if (vars/var? protocol) @protocol protocol)
-                        protocol-ns (:ns protocol)
-                        pns (str (vars/getName protocol-ns))
-                        fq-meth-name #(symbol pns %)]
-                    (map (fn [[method-name bodies]]
-                           (let [bodies (map rest bodies)
-                                 bodies (mapv (fn [impl]
-                                                (let [args (first impl)
-                                                      this (first args)
-                                                      bindings (vec (mapcat (fn [field]
-                                                                              [field (list (keyword field) this)])
-                                                                            fields))]
-                                                  `(~args
-                                                    (let ~bindings
-                                                      ~@(next impl))))) bodies)]
-                             `(defmethod ~(fq-meth-name (str method-name)) '~rec-type ~@bodies)))
-                         impls)))
-                protocol-impls)]
+        (mapcat
+         (fn [[protocol-name & impls] #?(:clj expr :cljs expr)]
+           (let [impls (group-by first impls)
+                 protocol (@utils/eval-resolve-state ctx protocol-name)
+                 _ (when-not protocol
+                     (utils/throw-error-with-location
+                      (str "Protocol not found: " protocol-name)
+                      expr))
+                 #?@(:clj [_ (assert-no-jvm-interface protocol protocol-name expr)])
+                 protocol (if (vars/var? protocol) @protocol protocol)
+                 protocol-ns (:ns protocol) pns (str (vars/getName protocol-ns))
+                 fq-meth-name #(symbol pns %)]
+             (map (fn [[method-name bodies]]
+                    (let [bodies (map rest bodies)
+                          bodies (mapv (fn [impl]
+                                         (let [args (first impl)
+                                               body (rest impl)
+                                               destr (utils/maybe-destructured args body)
+                                               args (:params destr)
+                                               orig-this-sym (first args)
+                                               rest-args (rest args)
+                                               shadows-this? (some #(= orig-this-sym %) rest-args)
+                                               this-sym (if shadows-this?
+                                                          (gensym "this_")
+                                                          orig-this-sym)
+                                               args (if shadows-this?
+                                                      (vec (cons this-sym rest-args))
+                                                      args)
+                                               bindings (mapcat (fn [field]
+                                                                  [field (list (keyword field) this-sym)])
+                                                                (reduce disj field-set args))
+                                               bindings (if shadows-this?
+                                                          (concat bindings [orig-this-sym this-sym])
+                                                          bindings)
+                                               bindings (vec bindings)]
+                                           `(~args
+                                             (let ~bindings
+                                               ~@body)))) bodies)]
+                      `(defmethod ~(fq-meth-name (str method-name)) '~rec-type ~@bodies)))
+                  impls)))
+         protocol-impls
+         raw-protocol-impls)]
     `(do
        (defn ~map-factory-sym [m#]
          (vary-meta m#

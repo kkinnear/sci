@@ -35,3 +35,40 @@
                  (:locals (ex-data e))))
           ks (keys locals)]
       (is (= '[x] ks)))))
+
+(deftest arity-error-test
+  (testing "The name of the correct function is reported"
+    (is (thrown-with-msg?
+         #?(:clj clojure.lang.ExceptionInfo :cljs cljs.core/ExceptionInfo)
+         #"Wrong number of args \(0\) passed to: foo/echo-msg"
+         (eval-string "
+(ns foo)
+
+(defn echo-msg [msg]
+  msg)
+
+(ns bar (:require foo))
+
+(defn main []
+  (foo/echo-msg))  ;; called with the wrong arity
+
+(main)")))))
+
+(deftest inherited-ex-data-is-encapsulated
+  (testing "The original ex-data is encapsulated."
+    (is (= [{:column 22
+             :file nil
+             :line 2
+             :locals {}
+             :message "ex-message"
+             :type :sci/error}
+            {:column 3}]
+           (try
+             (eval-string "
+(defn throwing-fn [] (throw (ex-info \"ex-message\" {:column 3})))
+
+(throwing-fn)")
+             (catch #?(:clj clojure.lang.ExceptionInfo :cljs cljs.core/ExceptionInfo) e
+               [(dissoc (ex-data e) :sci.impl/callstack)
+                (ex-data #?(:clj (.getCause e)
+                            :cljs (ex-cause e)))]))))))

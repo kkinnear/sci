@@ -18,10 +18,12 @@
           (if (keyword? opt) [{opt (second signatures)} (nnext signatures)]
               [nil signatures]))
         current-ns (str (vars/current-ns-name))
+        fq-name (symbol current-ns (str protocol-name))
         expansion
         `(do
            (def  ~(with-meta protocol-name
                     {:doc docstring}) {:methods #{}
+                                       :name '~fq-name
                                        :ns *ns*})
            ~@(map (fn [[method-name & _]]
                     (let [fq-name (symbol (str current-ns) (str method-name))
@@ -105,18 +107,41 @@
                                    ~atype ~(second meth) ~@(nnext meth)))
                               meths)))) proto+meths))))
 
+;; IAtom can be implemented as a protocol on reify and defrecords in sci
+
+(defn find-matching-non-default-method [protocol obj]
+  (boolean (some #(when-let [m (get-method % (types/type-impl obj))]
+                    (let [ms (methods %)
+                          default (get ms :default)]
+                      (not (identical? m default))))
+                 (:methods protocol))))
+
 (defn satisfies? [protocol obj]
   (if #?(:clj (instance? sci.impl.types.IReified obj)
-         :cljs (clojure.core/satisfies? types/IReified obj))
-    (if-let [obj-type (types/getInterface obj)]
-      (= protocol obj-type)
-      false)
-    (boolean (some #(get-method % (types/type-impl obj)) (:methods protocol)))))
+         ;; in CLJS we currently don't support mixing "classes" and protocols,
+         ;; hence, the instance is always a Reified, thus we can avoid calling
+         ;; the slower satisfies?
+         :cljs (instance? sci.impl.types.Reified obj))
+    (contains? (types/getProtocols obj) protocol)
+    ;; can be record that is implementing this protocol
+    ;; or a type like String, etc. that implements a protocol via extend-type, etc.
+    #?(:cljs (let [p (:protocol protocol)]
+               (or
+                (and p
+                     (condp = p
+                       IDeref (cljs.core/satisfies? IDeref obj)
+                       ISwap (cljs.core/satisfies? ISwap obj)
+                       IReset (cljs.core/satisfies? IReset obj)))
+                (find-matching-non-default-method protocol obj)))
+       ;; NOTE: what if the protocol doesn't have any methods?
+       ;; This probably needs fixing
+       :clj (find-matching-non-default-method protocol obj))))
 
 (defn instance-impl [clazz x]
   (cond
     ;; fast path for Clojure when using normal clazz
-    #?@(:clj [(class? clazz) (instance? clazz x)])
+    #?@(:clj [(class? clazz)
+              (instance? clazz x)])
     ;; records are currently represented as a symbol with metadata
     (and (symbol? clazz) (some-> clazz meta :sci.impl/record))
     (= clazz (-> x meta :type))
@@ -125,6 +150,7 @@
               (if-let [c (:class clazz)]
                 ;; this is a protocol which is an interface on the JVM
                 (or (satisfies? clazz x)
+                    ;; this is the fallback because we excluded defaults for the core protocols
                     (instance? c x))
                 (satisfies? clazz x))])
     ;; could we have a fast path for CLJS too? please let me know!

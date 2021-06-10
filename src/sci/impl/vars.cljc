@@ -4,11 +4,13 @@
                             push-thread-bindings
                             get-thread-bindings
                             pop-thread-bindings
+                            with-bindings*
                             with-bindings
                             thread-bound?
                             alter-var-root
                             var-get
-                            var-set])
+                            var-set
+                            bound-fn*])
   (:require [sci.impl.macros :as macros]
             [sci.impl.types :as t]
             [sci.impl.unrestrict :refer [*unrestricted*]]
@@ -51,7 +53,8 @@
                        (locking (set! meta m))))))
 
 (defn namespace? [x]
-  (instance? sci.impl.vars.SciNamespace x))
+  (instance? #?(:clj sci.impl.vars.SciNamespace
+                :cljs sci.impl.vars/SciNamespace) x))
 
 (deftype Frame [bindings prev])
 
@@ -100,7 +103,7 @@
   (unbind [this]))
 
 (defn push-thread-bindings [bindings]
-  (let [frame (get-thread-binding-frame)
+  (let [^Frame frame (get-thread-binding-frame)
         bmap (.-bindings frame)
         bmap (reduce (fn [acc [var* val*]]
                        (when-not (dynamic-var? var*)
@@ -123,7 +126,8 @@
     (throw (new #?(:clj Exception :cljs js/Error) "No frame to pop."))))
 
 (defn get-thread-bindings []
-  (let [f (get-thread-binding-frame)]
+  (let [;; type hint added to prevent shadow-cljs warning, although fn has return tag
+        ^Frame f (get-thread-binding-frame)]
     (loop [ret {}
            kvs (seq (.-bindings f))]
       (if kvs
@@ -134,9 +138,11 @@
         ret))))
 
 (defn get-thread-binding ^TBox [sci-var]
-  (when-let [^Frame f #?(:clj (.get dvals)
+  (when-let [;; type hint added to prevent shadow-cljs warning, although fn has return tag
+             ^Frame f #?(:clj (.get dvals)
                          :cljs @dvals)]
-    (.get ^java.util.Map (.-bindings f) sci-var)))
+    #?(:clj (.get ^java.util.Map (.-bindings f) sci-var)
+       :cljs (.get (.-bindings f) sci-var))))
 
 (defn binding-conveyor-fn
   [f]
@@ -370,7 +376,8 @@
   (t/setVal v val))
 
 (defn var? [x]
-  (instance? sci.impl.vars.SciVar x))
+  (instance? #?(:clj sci.impl.vars.SciVar
+                :cljs sci.impl.vars/SciVar) x))
 
 (defn dynamic-var
   ([name]

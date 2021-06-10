@@ -196,6 +196,11 @@
   [opts]
   (opts/init opts))
 
+(defn merge-opts
+  "Updates a context with opts merged in and returns it."
+  [ctx opts]
+  (opts/merge-opts ctx opts))
+
 (defn fork
   "Forks a context (as produced with `init`) into a new context. Any new
   vars created in the new context won't be visible in the original
